@@ -18,18 +18,13 @@ import Redis from "ioredis";
 
 import type { ServerWebSocket } from "bun";
 
-import type {
-  ClientSignal,
-  RawSignal,
-  Room,
-  ServerWebSocketData,
-  TransferClient,
-} from "./types";
+import type { ClientSignal, RawSignal, Room, ServerWebSocketData, TransferClient } from "./types";
 
 const logger = pino({
   level: LOG_LEVEL,
   timestamp: pino.stdTimeFunctions.isoTime,
   base: { pid: process.pid },
+  transport: Bun.env.NODE_ENV !== "production" ? { target: "pino-pretty" } : undefined,
 });
 
 // optional redis
@@ -206,10 +201,7 @@ function handleWSOpen(ws: ServerWebSocket<ServerWebSocketData>) {
   );
 }
 
-function handleWSMessage(
-  ws: ServerWebSocket<ServerWebSocketData>,
-  message: string | Buffer
-) {
+function handleWSMessage(ws: ServerWebSocket<ServerWebSocketData>, message: string | Buffer) {
   try {
     const signal: RawSignal = JSON.parse(message.toString());
     const room: Room | undefined = rooms.get(ws.data.roomId);
@@ -286,10 +278,7 @@ function handleClientJoin(
       }
       existingClient.session = ws;
       existingClient.lastPongTime = Date.now();
-      logger.info(
-        { clientId: client.clientId, name: client.name },
-        "Client reconnected"
-      );
+      logger.info({ clientId: client.clientId, name: client.name }, "Client reconnected");
 
       // send cached messages
       existingClient.messageCache.forEach((message) => {
@@ -347,10 +336,7 @@ function handleClientJoin(
     if (session === ws) return;
     if (session.readyState === WebSocket.OPEN) {
       session.send(JSON.stringify(joinMessage));
-      logger.info(
-        { clientId: client.clientId, name: client.name },
-        "send join message to client"
-      );
+      logger.info({ clientId: client.clientId, name: client.name }, "send join message to client");
     } else {
       messageCache.push(joinMessage);
     }
@@ -471,10 +457,7 @@ function startHeartbeat() {
       room.clients.forEach((clientData, clientId) => {
         if (clientData.session.readyState === WebSocket.OPEN) {
           if (now - clientData.lastPongTime > PONG_TIMEOUT) {
-            logger.warn(
-              { clientId, roomId },
-              "Client timed out, closing connection"
-            );
+            logger.warn({ clientId, roomId }, "Client timed out, closing connection");
             clientData.session.close();
           } else {
             clientData.session.send(JSON.stringify({ type: "ping" }));
@@ -490,16 +473,11 @@ const addresses: string[] = [HOSTNAME];
 // get all ip addresses
 if (HOSTNAME === "0.0.0.0") {
   const interfaces = os.networkInterfaces();
-  const ips = Object.values(interfaces).flatMap((iface) =>
-    iface?.map((iface) => iface.address)
-  );
+  const ips = Object.values(interfaces).flatMap((iface) => iface?.map((iface) => iface.address));
   addresses.push(...(ips.filter((ip) => ip !== undefined) as string[]));
 }
 
-logger.info(
-  { port: server.port, hostname: HOSTNAME, addresses },
-  "WebSocket server started"
-);
+logger.info({ port: server.port, hostname: HOSTNAME, addresses }, "WebSocket server started");
 
 startHeartbeat();
 process.on("SIGINT", () => {
