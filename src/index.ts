@@ -6,7 +6,6 @@ import {
   PONG_TIMEOUT,
   DISCONNECT_TIMEOUT,
   REDIS_URL,
-  ALLOWED_ORIGINS,
   HOSTNAME,
   TLS_CA_FILES,
   TLS_KEY_FILE,
@@ -130,27 +129,10 @@ const server = Bun.serve<ServerWebSocketData>({
     const roomId = url.searchParams.get("room") || "";
     const passwordHash = url.searchParams.get("pwd") || "";
 
-    // get request origin
-    const origin = req.headers.get("Origin") || "";
-
     if (url.pathname.startsWith("/healthcheck")) {
-      // create new headers
-      const headers = new Headers({
-        "Cross-Origin-Opener-Policy": "same-origin",
-        "Cross-Origin-Embedder-Policy": "require-corp",
-      });
-
-      // if origin is allowed, set CORS headers
-      if (ALLOWED_ORIGINS.includes(origin)) {
-        headers.set("Access-Control-Allow-Origin", origin);
-        headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        headers.set("Access-Control-Allow-Headers", "Content-Type");
-      }
-
       return new Response("OK", {
         status: 200,
         statusText: "OK",
-        headers,
       });
     }
 
