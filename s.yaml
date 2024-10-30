@@ -1,40 +1,30 @@
 edition: 3.0.0
 name: webrtc-ws-signaling-server
-access: "undefined"
+access: "default"
 vars:
-  region: "cn-hongkong"
+  region: "cn-shenzhen"
   functionName: "webrtc-signaling-function"
 resources:
-  start_server:
+  ws-server:
     component: fc3
     actions:
-      pre-deploy:
-        - run: export PATH=/usr/local/versions/node/v20.8.1/bin:$PATH && npm install --production
-          path: .
+      pre-${regex('deploy|local')}:
+        - component: fc3 build --dockerfile ./Dockerfile
     props:
       region: ${vars.region}
       description: Serverless Devs WebRTC Signaling Server
-      runtime: custom.debian10
+      runtime: custom-container
       timeout: 3600
       cpu: 0.1
       memorySize: 128
       diskSize: 512
       instanceConcurrency: 100
-      layers:
-        - acs:fc:${vars.region}:official:layers/Nodejs20/versions/1
-      environmentVariables:
-        PATH: >-
-          /opt/nodejs20/bin:/usr/local/bin/apache-maven/bin:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/ruby/bin
-      customRuntimeConfig:
-        command:
-          - npm
-          - run
-          - start
-        port: 9000
+      customContainerConfig:
+        image: "registry.${vars.region}.aliyuncs.com/99precentpeople/weblink-ws-server:latest"
       provisionConfig:
         qualifier: LATEST
         target: 1
-        
+
       instanceLifecycleConfig:
         instanceHealthCheckConfig:
           type: http
