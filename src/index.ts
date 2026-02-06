@@ -26,6 +26,16 @@ const logger = pino({
   transport: Bun.env.NODE_ENV !== "production" ? { target: "pino-pretty" } : undefined,
 });
 
+type RedisSignal = RawSignal & {
+  origin?: string;
+  joinKind?: "request" | "announce";
+  joinId?: string;
+};
+
+const serverInstanceId =
+  crypto.randomUUID?.() ??
+  `${os.hostname()}-${process.pid}-${Date.now()}`;
+
 // optional redis
 const redisPub: Redis | null = REDIS_URL
   ? new Redis(REDIS_URL, {
@@ -81,16 +91,21 @@ function unsubscribeFromRedis(roomId: string) {
   subscribedChannels.delete(roomId);
 }
 
-function publishToRedis(roomId: string, signal: RawSignal) {
+function publishToRedis(roomId: string, signal: RedisSignal) {
   if (!redisPub) return;
-  // if redisSub not subscribe this channel, do nothing
-  if (!subscribedChannels.has(roomId)) return;
-  redisPub.publish(`room:${roomId}`, JSON.stringify(signal));
+  redisPub.publish(
+    `room:${roomId}`,
+    JSON.stringify({
+      ...signal,
+      origin: serverInstanceId,
+    }),
+  );
 }
 
 redisSub?.on("message", (channel, message) => {
-  const signal = JSON.parse(message) as RawSignal;
-  logger.info(`Received message on channel ${channel}: ${signal}`);
+  const signal = JSON.parse(message) as RedisSignal;
+  if (signal.origin === serverInstanceId) return;
+  logger.info(`Received message on channel ${channel}`);
   const roomId = channel.split(":")[1]; // room ID
   const room = rooms.get(roomId);
   if (!room) {
@@ -100,7 +115,7 @@ redisSub?.on("message", (channel, message) => {
 
   switch (signal.type) {
     case "join":
-      handleClientJoin(room, signal.data as TransferClient);
+      handleClientJoin(room, signal.data as TransferClient, undefined, signal);
       break;
     case "message":
       handleClientMessage(room, signal.data as ClientSignal);
@@ -232,6 +247,14 @@ function handleWSClose(ws: ServerWebSocket<ServerWebSocketData>) {
     return;
   }
 
+  if (clientData.session !== ws) {
+    logger.info(
+      { clientId: ws.data.clientId, roomId: room.id },
+      "Ignore stale close event"
+    );
+    return;
+  }
+
   // set disconnect timeout
   if (!clientData.disconnectTimeout) {
     clientData.disconnectTimeout = setTimeout(() => {
@@ -243,9 +266,12 @@ function handleWSClose(ws: ServerWebSocket<ServerWebSocketData>) {
 function handleClientJoin(
   room: Room,
   client: TransferClient,
-  ws?: ServerWebSocket<ServerWebSocketData>
+  ws?: ServerWebSocket<ServerWebSocketData>,
+  signal?: RedisSignal
 ) {
   const existingClient = room.clients.get(client.clientId);
+  const joinKind = signal?.joinKind ?? "request";
+  const joinId = signal?.joinId;
 
   // if local connection, set clientId and add to local room
   if (ws) {
@@ -256,6 +282,9 @@ function handleClientJoin(
       if (existingClient.disconnectTimeout) {
         clearTimeout(existingClient.disconnectTimeout);
         existingClient.disconnectTimeout = null;
+      }
+      if (existingClient.session !== ws) {
+        existingClient.session.close();
       }
       existingClient.session = ws;
       existingClient.lastPongTime = Date.now();
@@ -269,43 +298,58 @@ function handleClientJoin(
 
       return;
     }
-    // if client is not resuming
-    room.clients.delete(client.clientId);
-    const leaveMessage: RawSignal = {
-      type: "leave",
-      data: client,
-    };
-    room.clients.forEach((clientData) => {
-      if (clientData.session === ws) return;
-      if (clientData.session.readyState === WebSocket.OPEN) {
-        clientData.session.send(JSON.stringify(leaveMessage));
-        logger.info(
-          {
-            clientId: clientData.client.clientId,
-            name: clientData.client.name,
-          },
-          "send leave message to client"
-        );
-      } else {
-        clientData.messageCache.push(leaveMessage);
+
+    // same clientId, not resuming: replace the old session
+    if (existingClient) {
+      if (existingClient.disconnectTimeout) {
+        clearTimeout(existingClient.disconnectTimeout);
+        existingClient.disconnectTimeout = null;
       }
-    });
-    publishToRedis(room.id, leaveMessage);
+      if (existingClient.session !== ws) {
+        existingClient.session.close();
+      }
+
+      room.clients.delete(client.clientId);
+
+      const leaveMessage: RawSignal = {
+        type: "leave",
+        data: existingClient.client,
+      };
+      room.clients.forEach((clientData) => {
+        if (clientData.session === ws) return;
+        if (clientData.session.readyState === WebSocket.OPEN) {
+          clientData.session.send(JSON.stringify(leaveMessage));
+          logger.info(
+            {
+              clientId: clientData.client.clientId,
+              name: clientData.client.name,
+            },
+            "send leave message to client",
+          );
+        } else {
+          clientData.messageCache.push(leaveMessage);
+        }
+      });
+      publishToRedis(room.id, leaveMessage);
+    }
   }
 
   // send join message to new client
-  room.clients.forEach(({ client }) => {
+  room.clients.forEach(({ client: existingLocalClient }) => {
     const joinMessage: RawSignal = {
       type: "join",
-      data: client,
+      data: existingLocalClient,
     };
     if (ws) {
-      // if local connection, send join message to client
       ws.send(JSON.stringify(joinMessage));
-    } else {
-      // if remote connection, publish join message to redis
-      publishToRedis(room.id, joinMessage);
+      return;
     }
+    if (joinKind === "announce") return;
+    publishToRedis(room.id, {
+      ...joinMessage,
+      joinKind: "announce",
+      joinId,
+    });
   });
 
   const joinMessage: RawSignal = {
@@ -332,7 +376,11 @@ function handleClientJoin(
       messageCache: [],
     });
 
-    publishToRedis(room.id, joinMessage);
+    publishToRedis(room.id, {
+      ...joinMessage,
+      joinKind: "request",
+      joinId: crypto.randomUUID?.(),
+    });
   }
 }
 
@@ -397,13 +445,12 @@ function handleClientMessage(
   const clientData = room?.clients.get(data.clientId || "");
 
   if (targetClientData) {
+    const message: RawSignal = {
+      type: "message",
+      data,
+    };
     if (targetClientData.session.readyState === WebSocket.OPEN) {
-      targetClientData.session.send(
-        JSON.stringify({
-          type: "message",
-          data: data,
-        })
-      );
+      targetClientData.session.send(JSON.stringify(message));
       logger.debug(
         {
           clientId: data.clientId,
@@ -413,11 +460,16 @@ function handleClientMessage(
         },
         "send message to client"
       );
+    } else {
+      targetClientData.messageCache.push(message);
     }
   } else {
     // local client message, publish to redis
     if (ws) {
-      publishToRedis(room.id, data);
+      publishToRedis(room.id, {
+        type: "message",
+        data,
+      });
 
       logger.debug(
         {
