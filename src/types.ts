@@ -7,6 +7,7 @@ export interface Client {
   clientId: ClientID;
   name: string;
   avatar: string | null;
+  rtcProfileVersion?: number;
 }
 export type TransferClient = Client & {
   createdAt: number;

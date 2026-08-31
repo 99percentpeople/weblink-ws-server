@@ -36,6 +36,27 @@ const serverInstanceId =
   crypto.randomUUID?.() ??
   `${os.hostname()}-${process.pid}-${Date.now()}`;
 
+const RTC_PROFILE_PROTOCOL_VERSION = 1;
+
+function normalizeClientPresence(client: TransferClient): TransferClient {
+  if (
+    !client.rtcProfileVersion ||
+    client.rtcProfileVersion < RTC_PROFILE_PROTOCOL_VERSION
+  ) {
+    return client;
+  }
+
+  const suffix = client.clientId.replaceAll("-", "").slice(0, 8);
+  return {
+    clientId: client.clientId,
+    name: `Peer-${suffix || "unknown"}`,
+    avatar: null,
+    createdAt: client.createdAt,
+    rtcProfileVersion: client.rtcProfileVersion,
+    resume: client.resume,
+  };
+}
+
 // optional redis
 const redisPub: Redis | null = REDIS_URL
   ? new Redis(REDIS_URL, {
@@ -269,6 +290,7 @@ function handleClientJoin(
   ws?: ServerWebSocket<ServerWebSocketData>,
   signal?: RedisSignal
 ) {
+  client = normalizeClientPresence(client);
   const existingClient = room.clients.get(client.clientId);
   const joinKind = signal?.joinKind ?? "request";
   const joinId = signal?.joinId;
@@ -286,9 +308,10 @@ function handleClientJoin(
       if (existingClient.session !== ws) {
         existingClient.session.close();
       }
+      existingClient.client = client;
       existingClient.session = ws;
       existingClient.lastPongTime = Date.now();
-      logger.info({ clientId: client.clientId, name: client.name }, "Client reconnected");
+      logger.info({ clientId: client.clientId }, "Client reconnected");
 
       // send cached messages
       existingClient.messageCache.forEach((message) => {
@@ -320,10 +343,7 @@ function handleClientJoin(
         if (clientData.session.readyState === WebSocket.OPEN) {
           clientData.session.send(JSON.stringify(leaveMessage));
           logger.info(
-            {
-              clientId: clientData.client.clientId,
-              name: clientData.client.name,
-            },
+            { clientId: clientData.client.clientId },
             "send leave message to client",
           );
         } else {
@@ -361,7 +381,7 @@ function handleClientJoin(
     if (session === ws) return;
     if (session.readyState === WebSocket.OPEN) {
       session.send(JSON.stringify(joinMessage));
-      logger.info({ clientId: client.clientId, name: client.name }, "send join message to client");
+      logger.info({ clientId: client.clientId }, "send join message to client");
     } else {
       messageCache.push(joinMessage);
     }
@@ -389,6 +409,7 @@ function handleClientLeave(
   client: TransferClient,
   ws?: ServerWebSocket<ServerWebSocketData>
 ) {
+  client = normalizeClientPresence(client);
   if (ws) {
     const clientData = room.clients.get(client.clientId);
     if (!clientData) {
@@ -404,7 +425,7 @@ function handleClientLeave(
     // remove client from room
     room.clients.delete(client.clientId);
   }
-  logger.info({ clientId: client.clientId, name: client.name }, "Client left");
+  logger.info({ clientId: client.clientId }, "Client left");
 
   const leaveMessage: RawSignal = {
     type: "leave",
@@ -413,10 +434,7 @@ function handleClientLeave(
   room.clients.forEach((targetClientData, targetClientId) => {
     if (targetClientData.session.readyState === WebSocket.OPEN) {
       targetClientData.session.send(JSON.stringify(leaveMessage));
-      logger.info(
-        { targetClientId, targetName: targetClientData.client.name },
-        "Send leave message"
-      );
+      logger.info({ targetClientId }, "Send leave message");
     } else {
       targetClientData.messageCache.push(leaveMessage);
     }
@@ -442,7 +460,6 @@ function handleClientMessage(
   ws?: ServerWebSocket<ServerWebSocketData>
 ) {
   const targetClientData = room?.clients.get(data.targetClientId);
-  const clientData = room?.clients.get(data.clientId || "");
 
   if (targetClientData) {
     const message: RawSignal = {
@@ -454,9 +471,7 @@ function handleClientMessage(
       logger.debug(
         {
           clientId: data.clientId,
-          clientName: clientData?.client.name,
           targetClientId: data.targetClientId,
-          targetClientName: targetClientData.client.name,
         },
         "send message to client"
       );
@@ -474,7 +489,6 @@ function handleClientMessage(
       logger.debug(
         {
           clientId: data.clientId,
-          clientName: clientData?.client.name,
           targetClientId: data.targetClientId,
         },
         "publish message to redis"
