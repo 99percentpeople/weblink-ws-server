@@ -18,6 +18,7 @@ import Redis from "ioredis";
 import type { ServerWebSocket } from "bun";
 
 import type { ClientSignal, RawSignal, Room, ServerWebSocketData, TransferClient } from "./types";
+import { normalizeClientPresence } from "./protocol";
 
 const logger = pino({
   level: LOG_LEVEL,
@@ -35,27 +36,6 @@ type RedisSignal = RawSignal & {
 const serverInstanceId =
   crypto.randomUUID?.() ??
   `${os.hostname()}-${process.pid}-${Date.now()}`;
-
-const RTC_PROFILE_PROTOCOL_VERSION = 1;
-
-function normalizeClientPresence(client: TransferClient): TransferClient {
-  if (
-    !client.rtcProfileVersion ||
-    client.rtcProfileVersion < RTC_PROFILE_PROTOCOL_VERSION
-  ) {
-    return client;
-  }
-
-  const suffix = client.clientId.replaceAll("-", "").slice(0, 8);
-  return {
-    clientId: client.clientId,
-    name: `Peer-${suffix || "unknown"}`,
-    avatar: null,
-    createdAt: client.createdAt,
-    rtcProfileVersion: client.rtcProfileVersion,
-    resume: client.resume,
-  };
-}
 
 // optional redis
 const redisPub: Redis | null = REDIS_URL

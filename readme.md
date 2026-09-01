@@ -8,7 +8,7 @@ Redis URLs can be set to enable a distributed architecture that prioritizes loca
 
 ### Profile Privacy
 
-Clients that advertise RTC profile protocol support publish only an anonymous placeholder through signaling. The server normalizes those presence records before storing, broadcasting, or publishing them to Redis. Real display names and avatars are exchanged directly between peers over WebRTC. Legacy clients without the capability marker keep their previous signaling behavior for compatibility.
+Signaling presence contains only room/connection metadata such as `clientId`, `createdAt`, the RTC profile protocol version, and the reconnect flag. The server discards incoming `name` and `avatar` fields before storing, broadcasting, or publishing presence to Redis. All display names and avatars are exchanged directly between peers over WebRTC.
 
 ### TLS Setup
 

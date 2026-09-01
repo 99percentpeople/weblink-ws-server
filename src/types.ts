@@ -3,16 +3,12 @@ import type { ServerWebSocket } from "bun";
 export type SessionID = string;
 export type ClientID = string;
 
-export interface Client {
+export interface TransferClient {
   clientId: ClientID;
-  name: string;
-  avatar: string | null;
-  rtcProfileVersion?: number;
-}
-export type TransferClient = Client & {
   createdAt: number;
+  rtcProfileVersion?: number;
   resume?: boolean;
-};
+}
 
 export interface RawSignal {
   type: string;
