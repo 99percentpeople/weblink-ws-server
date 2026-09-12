@@ -17,14 +17,21 @@ import Redis from "ioredis";
 
 import type { ServerWebSocket } from "bun";
 
-import type { ClientSignal, RawSignal, Room, ServerWebSocketData, TransferClient } from "./types";
-import { normalizeClientPresence } from "./protocol";
+import type {
+  ClientSignal,
+  RawSignal,
+  Room,
+  ServerWebSocketData,
+  TransferClient,
+} from "./types";
+import { createJoinAcknowledgement, normalizeClientPresence } from "./protocol";
 
 const logger = pino({
   level: LOG_LEVEL,
   timestamp: pino.stdTimeFunctions.isoTime,
   base: { pid: process.pid },
-  transport: Bun.env.NODE_ENV !== "production" ? { target: "pino-pretty" } : undefined,
+  transport:
+    Bun.env.NODE_ENV !== "production" ? { target: "pino-pretty" } : undefined,
 });
 
 type RedisSignal = RawSignal & {
@@ -34,8 +41,7 @@ type RedisSignal = RawSignal & {
 };
 
 const serverInstanceId =
-  crypto.randomUUID?.() ??
-  `${os.hostname()}-${process.pid}-${Date.now()}`;
+  crypto.randomUUID?.() ?? `${os.hostname()}-${process.pid}-${Date.now()}`;
 
 // optional redis
 const redisPub: Redis | null = REDIS_URL
@@ -195,11 +201,22 @@ function handleWSOpen(ws: ServerWebSocket<ServerWebSocketData>) {
     JSON.stringify({
       type: "connected",
       data: room.passwordHash,
-    })
+    }),
   );
 }
 
-function handleWSMessage(ws: ServerWebSocket<ServerWebSocketData>, message: string | Buffer) {
+function acknowledgeClientJoin(
+  ws: ServerWebSocket<ServerWebSocketData>,
+  resumed: boolean,
+) {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify(createJoinAcknowledgement(resumed)));
+}
+
+function handleWSMessage(
+  ws: ServerWebSocket<ServerWebSocketData>,
+  message: string | Buffer,
+) {
   try {
     const signal: RawSignal = JSON.parse(message.toString());
     const room: Room | undefined = rooms.get(ws.data.roomId);
@@ -251,7 +268,7 @@ function handleWSClose(ws: ServerWebSocket<ServerWebSocketData>) {
   if (clientData.session !== ws) {
     logger.info(
       { clientId: ws.data.clientId, roomId: room.id },
-      "Ignore stale close event"
+      "Ignore stale close event",
     );
     return;
   }
@@ -268,7 +285,7 @@ function handleClientJoin(
   room: Room,
   client: TransferClient,
   ws?: ServerWebSocket<ServerWebSocketData>,
-  signal?: RedisSignal
+  signal?: RedisSignal,
 ) {
   client = normalizeClientPresence(client);
   const existingClient = room.clients.get(client.clientId);
@@ -292,6 +309,7 @@ function handleClientJoin(
       existingClient.session = ws;
       existingClient.lastPongTime = Date.now();
       logger.info({ clientId: client.clientId }, "Client reconnected");
+      acknowledgeClientJoin(ws, true);
 
       // send cached messages
       existingClient.messageCache.forEach((message) => {
@@ -332,6 +350,10 @@ function handleClientJoin(
       });
       publishToRedis(room.id, leaveMessage);
     }
+  }
+
+  if (ws) {
+    acknowledgeClientJoin(ws, false);
   }
 
   // send join message to new client
@@ -387,7 +409,7 @@ function handleClientJoin(
 function handleClientLeave(
   room: Room,
   client: TransferClient,
-  ws?: ServerWebSocket<ServerWebSocketData>
+  ws?: ServerWebSocket<ServerWebSocketData>,
 ) {
   client = normalizeClientPresence(client);
   if (ws) {
@@ -437,7 +459,7 @@ function handleClientLeave(
 function handleClientMessage(
   room: Room,
   data: ClientSignal,
-  ws?: ServerWebSocket<ServerWebSocketData>
+  ws?: ServerWebSocket<ServerWebSocketData>,
 ) {
   const targetClientData = room?.clients.get(data.targetClientId);
 
@@ -453,7 +475,7 @@ function handleClientMessage(
           clientId: data.clientId,
           targetClientId: data.targetClientId,
         },
-        "send message to client"
+        "send message to client",
       );
     } else {
       targetClientData.messageCache.push(message);
@@ -471,7 +493,7 @@ function handleClientMessage(
           clientId: data.clientId,
           targetClientId: data.targetClientId,
         },
-        "publish message to redis"
+        "publish message to redis",
       );
     }
   }
@@ -484,7 +506,10 @@ function startHeartbeat() {
       room.clients.forEach((clientData, clientId) => {
         if (clientData.session.readyState === WebSocket.OPEN) {
           if (now - clientData.lastPongTime > PONG_TIMEOUT) {
-            logger.warn({ clientId, roomId }, "Client timed out, closing connection");
+            logger.warn(
+              { clientId, roomId },
+              "Client timed out, closing connection",
+            );
             clientData.session.close();
           } else {
             clientData.session.send(JSON.stringify({ type: "ping" }));
@@ -500,11 +525,16 @@ const addresses: string[] = [HOSTNAME];
 // get all ip addresses
 if (HOSTNAME === "0.0.0.0") {
   const interfaces = os.networkInterfaces();
-  const ips = Object.values(interfaces).flatMap((iface) => iface?.map((iface) => iface.address));
+  const ips = Object.values(interfaces).flatMap((iface) =>
+    iface?.map((iface) => iface.address),
+  );
   addresses.push(...(ips.filter((ip) => ip !== undefined) as string[]));
 }
 
-logger.info({ port: server.port, hostname: HOSTNAME, addresses }, "WebSocket server started");
+logger.info(
+  { port: server.port, hostname: HOSTNAME, addresses },
+  "WebSocket server started",
+);
 
 startHeartbeat();
 process.on("SIGINT", () => {

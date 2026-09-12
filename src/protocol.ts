@@ -1,4 +1,16 @@
-import type { TransferClient } from "./types";
+import type { RawSignal, TransferClient } from "./types";
+
+export const SIGNALING_PROTOCOL_VERSION = 2;
+
+export function createJoinAcknowledgement(resumed: boolean): RawSignal {
+  return {
+    type: "joined",
+    data: {
+      protocolVersion: SIGNALING_PROTOCOL_VERSION,
+      resumed,
+    },
+  };
+}
 
 export function normalizeClientPresence(
   client: TransferClient,
