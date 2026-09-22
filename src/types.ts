@@ -25,11 +25,13 @@ export type ServerWebSocketData = {
   roomId: string;
   passwordHash: string;
   clientId: ClientID | null;
+  connectionId: string;
 };
 
 export interface ClientData {
   client: TransferClient;
   session: ServerWebSocket<ServerWebSocketData>;
+  connectionId: string;
   lastPongTime: number;
   disconnectTimeout: Timer | null;
   messageCache: RawSignal[];

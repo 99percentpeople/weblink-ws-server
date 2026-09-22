@@ -275,6 +275,79 @@ describe("WebSocket server security limits", () => {
     expect(bob.socket.readyState).toBe(WebSocket.OPEN);
   });
 
+  it("keeps the replacement socket authoritative over stale traffic", async () => {
+    const roomId = `replace-${Date.now()}`;
+    const oldAlice = await connect(roomId);
+    const bob = await connect(roomId);
+    await oldAlice.next();
+    await bob.next();
+
+    await join(oldAlice, client("alice-owner"));
+    await join(bob, client("bob-owner"));
+    await bob.next();
+    await oldAlice.next();
+
+    const replacement = await connect(roomId);
+    await replacement.next();
+    const acknowledgement = await join(
+      replacement,
+      client("alice-owner", {
+        createdAt: Date.now() + 1,
+      }),
+    );
+    expect(acknowledgement.data).toMatchObject({
+      resumed: false,
+    });
+
+    expect(await bob.next()).toMatchObject({
+      type: "leave",
+      data: { clientId: "alice-owner" },
+    });
+    expect(await replacement.next()).toMatchObject({
+      type: "join",
+      data: { clientId: "bob-owner" },
+    });
+    expect(await bob.next()).toMatchObject({
+      type: "join",
+      data: { clientId: "alice-owner" },
+    });
+
+    try {
+      oldAlice.send({
+        type: "message",
+        data: {
+          type: "candidate",
+          clientId: "alice-owner",
+          targetClientId: "bob-owner",
+          data: "stale-candidate",
+        },
+      });
+      oldAlice.send({ type: "leave", data: null });
+    } catch {
+      // The replacement may already have completed the old socket close.
+    }
+
+    replacement.send({
+      type: "message",
+      data: {
+        type: "candidate",
+        clientId: "alice-owner",
+        targetClientId: "bob-owner",
+        data: "current-candidate",
+      },
+    });
+
+    expect(await bob.next()).toEqual({
+      type: "message",
+      data: {
+        type: "candidate",
+        clientId: "alice-owner",
+        targetClientId: "bob-owner",
+        data: "current-candidate",
+      },
+    });
+  });
+
   it("closes a socket that tries to change client ID", async () => {
     const inbox = await connect(`change-id-${Date.now()}`);
     await inbox.next();

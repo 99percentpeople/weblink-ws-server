@@ -18,6 +18,7 @@ import Redis from "ioredis";
 import type { ServerWebSocket } from "bun";
 
 import type {
+  ClientData,
   ClientSignal,
   RawSignal,
   Room,
@@ -190,7 +191,12 @@ const server = Bun.serve<ServerWebSocketData>({
 
     if (
       server.upgrade(req, {
-        data: { roomId, passwordHash, clientId: null },
+        data: {
+          roomId,
+          passwordHash,
+          clientId: null,
+          connectionId: crypto.randomUUID(),
+        },
       })
     ) {
       return;
@@ -256,6 +262,26 @@ function sendError(ws: ServerWebSocket<ServerWebSocketData>, message: string) {
   );
 }
 
+function currentClientData(
+  room: Room,
+  ws: ServerWebSocket<ServerWebSocketData>,
+): ClientData | null {
+  const clientId = ws.data.clientId;
+  if (!clientId) return null;
+
+  const clientData = room.clients.get(clientId);
+  if (!clientData) return null;
+
+  if (
+    clientData.session !== ws ||
+    clientData.connectionId !== ws.data.connectionId
+  ) {
+    return null;
+  }
+
+  return clientData;
+}
+
 function cacheSignal(
   clientData: {
     messageCache: RawSignal[];
@@ -301,7 +327,7 @@ function handleWSMessage(
   }
 
   if (signal.type === "pong") {
-    const clientData = room.clients.get(ws.data.clientId || "");
+    const clientData = currentClientData(room, ws);
     if (clientData) {
       clientData.lastPongTime = Date.now();
     }
@@ -315,6 +341,10 @@ function handleWSMessage(
         sendError(ws, "Invalid client");
         return;
       }
+      if (ws.data.clientId && !currentClientData(room, ws)) {
+        ws.close(1008, "Stale client session");
+        return;
+      }
       handleClientJoin(room, client, ws);
       return;
     }
@@ -322,6 +352,10 @@ function handleWSMessage(
       const data = parseClientSignal(signal.data);
       if (!ws.data.clientId || !data || data.clientId !== ws.data.clientId) {
         sendError(ws, "Invalid client signal");
+        return;
+      }
+      if (!currentClientData(room, ws)) {
+        ws.close(1008, "Stale client session");
         return;
       }
       handleClientMessage(room, data, ws);
@@ -343,12 +377,8 @@ function handleWSClose(ws: ServerWebSocket<ServerWebSocketData>) {
     return;
   }
 
-  const clientData = room.clients.get(ws.data.clientId || "");
+  const clientData = currentClientData(room, ws);
   if (!clientData) {
-    return;
-  }
-
-  if (clientData.session !== ws) {
     logger.info(
       { clientId: ws.data.clientId, roomId: room.id },
       "Ignore stale close event",
@@ -382,7 +412,10 @@ function handleClientJoin(
       return;
     }
 
-    if (existingClient?.session === ws) {
+    if (
+      existingClient?.session === ws &&
+      existingClient.connectionId === ws.data.connectionId
+    ) {
       existingClient.client = client;
       existingClient.lastPongTime = Date.now();
       acknowledgeClientJoin(ws, client.resume === true);
@@ -402,6 +435,7 @@ function handleClientJoin(
       }
       existingClient.client = client;
       existingClient.session = ws;
+      existingClient.connectionId = ws.data.connectionId;
       existingClient.lastPongTime = Date.now();
       logger.info({ clientId: client.clientId }, "Client reconnected");
       acknowledgeClientJoin(ws, true);
@@ -488,6 +522,7 @@ function handleClientJoin(
     room.clients.set(client.clientId, {
       client,
       session: ws,
+      connectionId: ws.data.connectionId,
       lastPongTime: Date.now(),
       disconnectTimeout: null,
       messageCache: [],
@@ -511,8 +546,8 @@ function handleExplicitLeave(
     return;
   }
 
-  const clientData = room.clients.get(clientId);
-  if (!clientData || clientData.session !== ws) {
+  const clientData = currentClientData(room, ws);
+  if (!clientData) {
     ws.close(1000, "Left");
     return;
   }
@@ -527,8 +562,16 @@ function handleClientLeave(
 ) {
   client = normalizeClientPresence(client);
   if (ws) {
-    const clientData = room.clients.get(client.clientId);
+    const clientData = currentClientData(room, ws);
     if (!clientData) {
+      logger.info(
+        {
+          clientId: client.clientId,
+          roomId: room.id,
+          connectionId: ws.data.connectionId,
+        },
+        "Ignore stale leave event",
+      );
       return;
     }
 
