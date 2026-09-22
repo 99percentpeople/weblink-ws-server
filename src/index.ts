@@ -24,7 +24,18 @@ import type {
   ServerWebSocketData,
   TransferClient,
 } from "./types";
-import { createJoinAcknowledgement, normalizeClientPresence } from "./protocol";
+import {
+  MAX_CACHED_SIGNALS,
+  MAX_PASSWORD_HASH_LENGTH,
+  MAX_ROOM_ID_LENGTH,
+  MAX_SIGNAL_MESSAGE_BYTES,
+  createJoinAcknowledgement,
+  encodedMessageSize,
+  normalizeClientPresence,
+  parseClientSignal,
+  parseRawSignal,
+  parseTransferClient,
+} from "./protocol";
 
 const logger = pino({
   level: LOG_LEVEL,
@@ -148,13 +159,32 @@ const server = Bun.serve<ServerWebSocketData>({
     : undefined,
   fetch(req, server) {
     const url = new URL(req.url);
-    const roomId = url.searchParams.get("room") || "";
-    const passwordHash = url.searchParams.get("pwd") || "";
 
     if (url.pathname.startsWith("/healthcheck")) {
       return new Response("OK", {
         status: 200,
         statusText: "OK",
+      });
+    }
+
+    if (req.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return new Response("Expected a WebSocket upgrade", {
+        status: 426,
+      });
+    }
+
+    const roomId = url.searchParams.get("room")?.trim() ?? "";
+    const passwordHash = url.searchParams.get("pwd") ?? "";
+
+    if (!roomId || roomId.length > MAX_ROOM_ID_LENGTH) {
+      return new Response("Invalid room", {
+        status: 400,
+      });
+    }
+
+    if (passwordHash.length > MAX_PASSWORD_HASH_LENGTH) {
+      return new Response("Invalid password hash", {
+        status: 400,
       });
     }
 
@@ -166,7 +196,10 @@ const server = Bun.serve<ServerWebSocketData>({
       return;
     }
 
-    return new Response(undefined, { status: 400, statusText: "Bad Request" });
+    return new Response(undefined, {
+      status: 400,
+      statusText: "Bad Request",
+    });
   },
   websocket: {
     open(ws) {
@@ -213,43 +246,93 @@ function acknowledgeClientJoin(
   ws.send(JSON.stringify(createJoinAcknowledgement(resumed)));
 }
 
+function sendError(ws: ServerWebSocket<ServerWebSocketData>, message: string) {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  ws.send(
+    JSON.stringify({
+      type: "error",
+      data: message,
+    }),
+  );
+}
+
+function cacheSignal(
+  clientData: {
+    messageCache: RawSignal[];
+  },
+  signal: RawSignal,
+) {
+  clientData.messageCache.push(signal);
+  if (clientData.messageCache.length > MAX_CACHED_SIGNALS) {
+    clientData.messageCache.splice(
+      0,
+      clientData.messageCache.length - MAX_CACHED_SIGNALS,
+    );
+  }
+}
+
 function handleWSMessage(
   ws: ServerWebSocket<ServerWebSocketData>,
   message: string | Buffer,
 ) {
+  if (typeof message !== "string") {
+    ws.close(1003, "Text messages only");
+    return;
+  }
+
+  if (encodedMessageSize(message) > MAX_SIGNAL_MESSAGE_BYTES) {
+    ws.close(1009, "Message too large");
+    return;
+  }
+
+  let signal: RawSignal;
   try {
-    const signal: RawSignal = JSON.parse(message.toString());
-    const room: Room | undefined = rooms.get(ws.data.roomId);
-
-    if (!room) {
-      logger.warn({ roomId: ws.data.roomId }, "Room not found");
-      return;
-    }
-
-    if (signal.type === "pong") {
-      const clientData = room.clients.get(ws.data.clientId || "");
-      if (clientData) {
-        clientData.lastPongTime = Date.now();
-      }
-      return;
-    }
-
-    switch (signal.type) {
-      case "join":
-        handleClientJoin(room, signal.data as TransferClient, ws);
-        break;
-      case "message":
-        handleClientMessage(room, signal.data as ClientSignal, ws);
-        break;
-      case "leave":
-        handleClientLeave(room, signal.data as TransferClient, ws);
-        break;
-      default:
-        logger.warn({ signal }, "Unknown signal type");
-        break;
-    }
+    signal = parseRawSignal(message);
   } catch (error) {
-    logger.error({ error }, "Error processing message");
+    logger.warn({ error }, "Invalid signal");
+    sendError(ws, "Invalid signal");
+    return;
+  }
+
+  const room: Room | undefined = rooms.get(ws.data.roomId);
+  if (!room) {
+    logger.warn({ roomId: ws.data.roomId }, "Room not found");
+    return;
+  }
+
+  if (signal.type === "pong") {
+    const clientData = room.clients.get(ws.data.clientId || "");
+    if (clientData) {
+      clientData.lastPongTime = Date.now();
+    }
+    return;
+  }
+
+  switch (signal.type) {
+    case "join": {
+      const client = parseTransferClient(signal.data);
+      if (!client) {
+        sendError(ws, "Invalid client");
+        return;
+      }
+      handleClientJoin(room, client, ws);
+      return;
+    }
+    case "message": {
+      const data = parseClientSignal(signal.data);
+      if (!ws.data.clientId || !data || data.clientId !== ws.data.clientId) {
+        sendError(ws, "Invalid client signal");
+        return;
+      }
+      handleClientMessage(room, data, ws);
+      return;
+    }
+    case "leave":
+      handleExplicitLeave(room, ws);
+      return;
+    default:
+      logger.warn({ signal }, "Unknown signal type");
+      sendError(ws, "Unknown signal type");
   }
 }
 
@@ -292,8 +375,20 @@ function handleClientJoin(
   const joinKind = signal?.joinKind ?? "request";
   const joinId = signal?.joinId;
 
-  // if local connection, set clientId and add to local room
+  // if local connection, bind the socket to one client ID
   if (ws) {
+    if (ws.data.clientId && ws.data.clientId !== client.clientId) {
+      ws.close(1008, "Client ID cannot change");
+      return;
+    }
+
+    if (existingClient?.session === ws) {
+      existingClient.client = client;
+      existingClient.lastPongTime = Date.now();
+      acknowledgeClientJoin(ws, client.resume === true);
+      return;
+    }
+
     ws.data.clientId = client.clientId;
 
     if (existingClient && client.resume) {
@@ -345,7 +440,7 @@ function handleClientJoin(
             "send leave message to client",
           );
         } else {
-          clientData.messageCache.push(leaveMessage);
+          cacheSignal(clientData, leaveMessage);
         }
       });
       publishToRedis(room.id, leaveMessage);
@@ -385,7 +480,7 @@ function handleClientJoin(
       session.send(JSON.stringify(joinMessage));
       logger.info({ clientId: client.clientId }, "send join message to client");
     } else {
-      messageCache.push(joinMessage);
+      cacheSignal({ messageCache }, joinMessage);
     }
   });
 
@@ -404,6 +499,25 @@ function handleClientJoin(
       joinId: crypto.randomUUID?.(),
     });
   }
+}
+
+function handleExplicitLeave(
+  room: Room,
+  ws: ServerWebSocket<ServerWebSocketData>,
+) {
+  const clientId = ws.data.clientId;
+  if (!clientId) {
+    ws.close(1000, "Left");
+    return;
+  }
+
+  const clientData = room.clients.get(clientId);
+  if (!clientData || clientData.session !== ws) {
+    ws.close(1000, "Left");
+    return;
+  }
+
+  handleClientLeave(room, clientData.client, ws);
 }
 
 function handleClientLeave(
@@ -438,7 +552,7 @@ function handleClientLeave(
       targetClientData.session.send(JSON.stringify(leaveMessage));
       logger.info({ targetClientId }, "Send leave message");
     } else {
-      targetClientData.messageCache.push(leaveMessage);
+      cacheSignal(targetClientData, leaveMessage);
     }
   });
 
@@ -478,7 +592,7 @@ function handleClientMessage(
         "send message to client",
       );
     } else {
-      targetClientData.messageCache.push(message);
+      cacheSignal(targetClientData, message);
     }
   } else {
     // local client message, publish to redis

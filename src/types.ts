@@ -16,7 +16,7 @@ export interface RawSignal {
 }
 
 export interface ClientSignal extends RawSignal {
-  sessionId: SessionID;
+  sessionId?: SessionID;
   clientId: ClientID;
   targetClientId: ClientID;
 }
