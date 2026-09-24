@@ -434,5 +434,26 @@ describe("WebSocket server security limits", () => {
     expect(cached).toHaveLength(256);
     expect(cached[0]).toBe(44);
     expect(cached.at(-1)).toBe(299);
+    expect(await alice.next()).toEqual({
+      type: "peer-online",
+      data: {
+        clientId: "bob-cache",
+        connectionId: expect.any(String),
+      },
+    });
+    await join(resumed, client("bob-cache", { resume: true }));
+    resumed.send({
+      type: "message",
+      data: {
+        type: "offer",
+        clientId: "bob-cache",
+        targetClientId: "alice-cache",
+        data: "after-resume",
+      },
+    });
+    expect(await alice.next()).toMatchObject({
+      type: "message",
+      data: { data: "after-resume" },
+    });
   });
 });

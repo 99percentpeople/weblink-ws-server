@@ -31,6 +31,7 @@ import {
   MAX_ROOM_ID_LENGTH,
   MAX_SIGNAL_MESSAGE_BYTES,
   createJoinAcknowledgement,
+  createPeerOnline,
   encodedMessageSize,
   normalizeClientPresence,
   parseClientSignal,
@@ -141,6 +142,9 @@ redisSub?.on("message", (channel, message) => {
       break;
     case "leave":
       handleClientLeave(room, signal.data as TransferClient);
+      break;
+    case "peer-online":
+      broadcastPeerOnline(room, signal);
       break;
     default:
       logger.warn({ signal }, "redis unknown signal type");
@@ -446,6 +450,9 @@ function handleClientJoin(
       });
       existingClient.messageCache = [];
 
+      const online = createPeerOnline(client.clientId, ws.data.connectionId);
+      broadcastPeerOnline(room, online, ws);
+      publishToRedis(room.id, online);
       return;
     }
 
@@ -534,6 +541,20 @@ function handleClientJoin(
       joinId: crypto.randomUUID?.(),
     });
   }
+}
+
+// Availability is live-only: do not replay it later as if an old socket were
+// newly online. The joining socket has already received its acknowledgement.
+function broadcastPeerOnline(
+  room: Room,
+  signal: RawSignal,
+  exclude?: ServerWebSocket<ServerWebSocketData>,
+) {
+  room.clients.forEach(({ session }) => {
+    if (session !== exclude && session.readyState === WebSocket.OPEN) {
+      session.send(JSON.stringify(signal));
+    }
+  });
 }
 
 function handleExplicitLeave(

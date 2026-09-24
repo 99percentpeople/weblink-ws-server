@@ -81,6 +81,13 @@ export function encodedMessageSize(message: string): number {
   return new TextEncoder().encode(message).byteLength;
 }
 
+export function createPeerOnline(
+  clientId: string,
+  connectionId: string,
+): RawSignal {
+  return { type: "peer-online", data: { clientId, connectionId } };
+}
+
 export function createJoinAcknowledgement(resumed: boolean): RawSignal {
   return {
     type: "joined",
