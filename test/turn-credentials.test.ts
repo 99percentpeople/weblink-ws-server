@@ -117,7 +117,7 @@ describe("TURN credentials HTTP contract", () => {
     );
     expect(JSON.parse(String(init?.body))).toEqual({ ttl: 86400 });
     expect(init?.signal).toBeDefined();
-    expect(init?.redirect).toBe("error");
+    expect(init?.redirect).toBe("manual");
   });
 
   it("normalizes singular URL strings", async () => {

@@ -96,7 +96,7 @@ export async function handleTurnCredentials(
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ ttl: TURN_CREDENTIAL_TTL_SECONDS }),
-        redirect: "error",
+        redirect: "manual",
         signal,
       },
     );
