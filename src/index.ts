@@ -1,4 +1,5 @@
 import pino from "pino";
+import { handleTurnCredentials } from "./turn-credentials";
 import {
   LOG_LEVEL,
   PORT,
@@ -172,6 +173,13 @@ const server = Bun.serve<ServerWebSocketData>({
       });
     }
 
+    if (url.pathname === "/turn-credentials") {
+      return handleTurnCredentials(req, {
+        TURN_KEY_ID: Bun.env["TURN_KEY_ID"],
+        TURN_KEY_API_TOKEN: Bun.env["TURN_KEY_API_TOKEN"],
+      });
+    }
+
     if (req.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return new Response("Expected a WebSocket upgrade", {
         status: 426,
@@ -321,6 +329,11 @@ function handleWSMessage(
   } catch (error) {
     logger.warn({ error }, "Invalid signal");
     sendError(ws, "Invalid signal");
+    return;
+  }
+
+  if (signal.type === "ping") {
+    ws.send(JSON.stringify({ type: "pong" }));
     return;
   }
 

@@ -32,6 +32,42 @@ Signaling presence contains only room/connection metadata such as `clientId`, `c
 
 ### TLS Setup
 
-TLS is optional and can be enabled by setting the `TLS_CERT_FILE` and `TLS_KEY_FILE` environment variables or set in the .env file.
+TLS is optional and can be enabled with the `TLS_CERT_FILE` and `TLS_KEY_FILE` environment variables. For local development, copy `.env.example` to ignored `.env.local` and adjust it as needed.
 
-Optionally, a list of CA files can be set in the `TLS_CA_FILES` environment variable or .env file to enable mutual TLS.
+Optionally, set `TLS_CA_FILES` to a comma-separated list of CA files to enable mutual TLS.
+
+## Cloudflare TURN credentials
+
+`POST /turn-credentials` exchanges backend-owned Cloudflare TURN configuration
+for short-lived browser credentials. This is a public endpoint: it needs no
+WebSocket upgrade, room, authentication, or rate limiter. The service does not
+relay files or media; Cloudflare TURN carries relayed traffic.
+
+Set `TURN_KEY_ID` and `TURN_KEY_API_TOKEN` using the existing key values.
+The exchange uses Cloudflare's `credentials/generate-ice-servers` API and a fixed
+24-hour TTL. The JSON response is `{ iceServers, expiresAt }`, with `expiresAt`
+in Unix milliseconds. Credentials are not cached or stored by this backend.
+All responses have `Cache-Control: no-store` and `Access-Control-Allow-Origin: *`.
+`OPTIONS` returns 204, unsupported methods 405, unconfigured service 503,
+provider failure 502, and a 10-second upstream timeout 504. Only normalized
+WebRTC fields are returned; provider error details and long-term keys are not.
+
+The frontend discovers this endpoint from the root of its WebSocket origin,
+caches temporary credentials in memory, and refreshes on demand before
+connection/SDP negotiation when expiry is near. A reverse proxy must forward
+`/turn-credentials` as well as the WebSocket route. An unconfigured backend
+continues serving signaling normally; clients can still use custom STUN/TURN.
+
+Remove old `|cloudflare` values from frontend `VITE_TURN_SERVERS`/`PAGES_BUILD_ENV`
+after configuring this endpoint. No automatic key rotation is performed.
+
+Reference: [Cloudflare credential generation](https://developers.cloudflare.com/realtime/turn/generate-credentials/).
+
+Use process/container environment variables or copy `.env.example` to an ignored `.env.local`:
+
+```dotenv
+TURN_KEY_ID=<existing TURN key ID>
+TURN_KEY_API_TOKEN=<existing TURN key API token>
+```
+
+Do not put these values in `.env.example` or the Docker image.

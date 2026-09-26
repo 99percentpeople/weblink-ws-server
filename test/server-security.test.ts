@@ -185,6 +185,8 @@ beforeAll(async () => {
       PONG_TIMEOUT: "120000",
       DISCONNECT_TIMEOUT: "90000",
       REDIS_URL: "",
+      TURN_KEY_ID: "",
+      TURN_KEY_API_TOKEN: "",
     },
     stdin: "ignore",
     stdout: "ignore",
@@ -199,6 +201,37 @@ afterAll(async () => {
   }
   serverProcess.kill("SIGINT");
   await serverProcess.exited;
+});
+
+describe("TURN HTTP routing", () => {
+  it("routes preflight and credential requests without a WebSocket or room", async () => {
+    const preflight = await fetch(`${httpBase}/turn-credentials`, {
+      method: "OPTIONS",
+    });
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get("access-control-allow-origin")).toBe("*");
+    const credentials = await fetch(`${httpBase}/turn-credentials`, {
+      method: "POST",
+    });
+    expect(credentials.status).toBe(503);
+    expect(credentials.headers.get("cache-control")).toBe("no-store");
+    expect(await credentials.json()).toEqual({
+      error: "TURN is not configured",
+    });
+  });
+});
+
+describe("WebSocket heartbeat compatibility", () => {
+  it("responds to a client heartbeat ping with pong", async () => {
+    const inbox = await connect(`heartbeat-${Date.now()}`);
+    await expect(inbox.next()).resolves.toMatchObject({
+      type: "connected",
+    });
+    inbox.send({ type: "ping", data: undefined });
+    await expect(inbox.next()).resolves.toMatchObject({
+      type: "pong",
+    });
+  });
 });
 
 describe("WebSocket server security limits", () => {
