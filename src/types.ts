@@ -26,12 +26,14 @@ export type ServerWebSocketData = {
   passwordHash: string;
   clientId: ClientID | null;
   connectionId: string;
+  identityKey?: string;
 };
 
 export interface ClientData {
   client: TransferClient;
   session: ServerWebSocket<ServerWebSocketData>;
   connectionId: string;
+  identityKey?: string;
   lastPongTime: number;
   disconnectTimeout: Timer | null;
   messageCache: RawSignal[];

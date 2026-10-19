@@ -1,3 +1,5 @@
+import { DeviceLeases } from "./device-lease";
+import { verifyJoinIdentity, mayReplace } from "./device-identity";
 import pino from "pino";
 import { handleTurnCredentials } from "./turn-credentials";
 import {
@@ -76,6 +78,18 @@ if (redisPub) {
   logger.warn("Redis is disabled");
 }
 
+const leases = redisPub
+  ? new DeviceLeases(
+      redisPub,
+      serverInstanceId,
+      PONG_TIMEOUT + DISCONNECT_TIMEOUT + HEARTBEAT_INTERVAL + 10000,
+    )
+  : undefined;
+const messageTails = new WeakMap<
+  ServerWebSocket<ServerWebSocketData>,
+  Promise<void>
+>();
+
 const redisSub: Redis | null = redisPub?.duplicate() ?? null;
 
 redisPub?.on("error", (err) => {
@@ -127,7 +141,7 @@ redisSub?.on("message", (channel, message) => {
   const signal = JSON.parse(message) as RedisSignal;
   if (signal.origin === serverInstanceId) return;
   logger.info(`Received message on channel ${channel}`);
-  const roomId = channel.split(":")[1]; // room ID
+  const roomId = channel.slice("room:".length); // room ID
   const room = rooms.get(roomId);
   if (!room) {
     logger.warn({ roomId }, "can not handle redis message, room not found");
@@ -224,7 +238,13 @@ const server = Bun.serve<ServerWebSocketData>({
       handleWSOpen(ws);
     },
     message(ws, message) {
-      handleWSMessage(ws, message);
+      const tail = (messageTails.get(ws) ?? Promise.resolve())
+        .then(() => handleWSMessage(ws, message))
+        .catch((error) => {
+          logger.error({ error }, "Signaling authorization failed");
+          ws.close(1011, "Authorization unavailable");
+        });
+      messageTails.set(ws, tail);
     },
     close(ws) {
       handleWSClose(ws);
@@ -252,6 +272,7 @@ function handleWSOpen(ws: ServerWebSocket<ServerWebSocketData>) {
     JSON.stringify({
       type: "connected",
       data: room.passwordHash,
+      identityChallenge: ws.data.connectionId,
     }),
   );
 }
@@ -309,7 +330,7 @@ function cacheSignal(
   }
 }
 
-function handleWSMessage(
+async function handleWSMessage(
   ws: ServerWebSocket<ServerWebSocketData>,
   message: string | Buffer,
 ) {
@@ -346,6 +367,18 @@ function handleWSMessage(
   if (signal.type === "pong") {
     const clientData = currentClientData(room, ws);
     if (clientData) {
+      if (
+        leases &&
+        !(await leases.refresh(
+          room.id,
+          clientData.client.clientId,
+          ws.data.connectionId,
+        ))
+      ) {
+        retireLostLease(room, ws);
+        ws.close(1008, "Device lease expired");
+        return;
+      }
       clientData.lastPongTime = Date.now();
     }
     return;
@@ -358,8 +391,37 @@ function handleWSMessage(
         sendError(ws, "Invalid client");
         return;
       }
+      if (ws.data.clientId && ws.data.clientId !== client.clientId) {
+        ws.close(1008, "Client ID cannot change");
+        return;
+      }
       if (ws.data.clientId && !currentClientData(room, ws)) {
         ws.close(1008, "Stale client session");
+        return;
+      }
+      if (!ws.data.clientId)
+        ws.data.identityKey = await verifyJoinIdentity(
+          ws.data.connectionId,
+          client.clientId,
+          client.createdAt,
+          signal.data?.identityProof,
+        );
+      if (ws.readyState !== WebSocket.OPEN) return;
+      if (
+        leases &&
+        !(await leases.claim(
+          room.id,
+          client.clientId,
+          ws.data.connectionId,
+          ws.data.identityKey,
+        ))
+      ) {
+        sendError(ws, "DUPLICATE_DEVICE_ID");
+        ws.close(1008, "Duplicate device ID");
+        return;
+      }
+      if (ws.readyState !== WebSocket.OPEN) {
+        await leases?.release(room.id, client.clientId, ws.data.connectionId);
         return;
       }
       handleClientJoin(room, client, ws);
@@ -375,16 +437,41 @@ function handleWSMessage(
         ws.close(1008, "Stale client session");
         return;
       }
+      if (
+        leases &&
+        !(await leases.refresh(room.id, data.clientId, ws.data.connectionId))
+      ) {
+        retireLostLease(room, ws);
+        ws.close(1008, "Device lease expired");
+        return;
+      }
       handleClientMessage(room, data, ws);
       return;
     }
     case "leave":
+      if (
+        leases &&
+        ws.data.clientId &&
+        !(await leases.refresh(room.id, ws.data.clientId, ws.data.connectionId))
+      ) {
+        retireLostLease(room, ws);
+        ws.close(1008, "Device lease expired");
+        return;
+      }
       handleExplicitLeave(room, ws);
       return;
     default:
       logger.warn({ signal }, "Unknown signal type");
       sendError(ws, "Unknown signal type");
   }
+}
+
+function retireLostLease(room: Room, ws: ServerWebSocket<ServerWebSocketData>) {
+  const current = currentClientData(room, ws);
+  if (!current) return;
+  if (current.disconnectTimeout) clearTimeout(current.disconnectTimeout);
+  room.clients.delete(current.client.clientId);
+  ws.data.clientId = null;
 }
 
 function handleWSClose(ws: ServerWebSocket<ServerWebSocketData>) {
@@ -406,7 +493,22 @@ function handleWSClose(ws: ServerWebSocket<ServerWebSocketData>) {
   // set disconnect timeout
   if (!clientData.disconnectTimeout) {
     clientData.disconnectTimeout = setTimeout(() => {
-      handleClientLeave(room, clientData.client, clientData.session);
+      void (async () => {
+        if (
+          leases &&
+          !(await leases.refresh(
+            room.id,
+            clientData.client.clientId,
+            ws.data.connectionId,
+          ))
+        ) {
+          retireLostLease(room, ws);
+          return;
+        }
+        handleClientLeave(room, clientData.client, ws);
+      })().catch((error) =>
+        logger.error({ error }, "Lease expiry check failed"),
+      );
     }, DISCONNECT_TIMEOUT);
   }
 }
@@ -439,6 +541,14 @@ function handleClientJoin(
       return;
     }
 
+    if (
+      existingClient &&
+      !mayReplace(existingClient.identityKey, ws.data.identityKey)
+    ) {
+      sendError(ws, "DUPLICATE_DEVICE_ID");
+      ws.close(1008, "Duplicate device ID");
+      return;
+    }
     ws.data.clientId = client.clientId;
 
     if (existingClient && client.resume) {
@@ -448,11 +558,12 @@ function handleClientJoin(
         existingClient.disconnectTimeout = null;
       }
       if (existingClient.session !== ws) {
-        existingClient.session.close();
+        existingClient.session.close(1000, "Session resumed elsewhere");
       }
       existingClient.client = client;
       existingClient.session = ws;
       existingClient.connectionId = ws.data.connectionId;
+      existingClient.identityKey = ws.data.identityKey;
       existingClient.lastPongTime = Date.now();
       logger.info({ clientId: client.clientId }, "Client reconnected");
       acknowledgeClientJoin(ws, true);
@@ -476,7 +587,7 @@ function handleClientJoin(
         existingClient.disconnectTimeout = null;
       }
       if (existingClient.session !== ws) {
-        existingClient.session.close();
+        existingClient.session.close(1000, "Session replaced");
       }
 
       room.clients.delete(client.clientId);
@@ -543,6 +654,7 @@ function handleClientJoin(
       client,
       session: ws,
       connectionId: ws.data.connectionId,
+      identityKey: ws.data.identityKey,
       lastPongTime: Date.now(),
       disconnectTimeout: null,
       messageCache: [],
@@ -615,6 +727,10 @@ function handleClientLeave(
       clientData.disconnectTimeout = null;
     }
 
+    // Compare-and-delete prevents an old socket from releasing a replacement.
+    void leases
+      ?.release(room.id, client.clientId, ws.data.connectionId)
+      .catch((error) => logger.error({ error }, "Lease release failed"));
     // remove client from room
     room.clients.delete(client.clientId);
   }
