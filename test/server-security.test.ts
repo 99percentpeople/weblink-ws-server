@@ -201,8 +201,12 @@ async function signed(
     identityProof: { publicKey, signature },
   };
 }
-async function join(inbox: SocketInbox, value: unknown): Promise<RawSignal> {
-  value = await signed(inbox, value as TransferClient);
+async function join(
+  inbox: SocketInbox,
+  value: unknown,
+  withIdentity = true,
+): Promise<RawSignal> {
+  if (withIdentity) value = await signed(inbox, value as TransferClient);
   inbox.send({
     type: "join",
     data: value,
@@ -355,78 +359,83 @@ describe("WebSocket server security limits", () => {
     expect(bob.socket.readyState).toBe(WebSocket.OPEN);
   });
 
-  it("keeps the replacement socket authoritative over stale traffic", async () => {
-    const roomId = `replace-${Date.now()}`;
-    const oldAlice = await connect(roomId);
-    const bob = await connect(roomId);
-    await oldAlice.next();
-    await bob.next();
+  it.each([true, false])(
+    "keeps the replacement socket authoritative over stale traffic (signed=%s)",
+    async (withIdentity) => {
+      const joinPeer = (inbox: SocketInbox, value: unknown) =>
+        join(inbox, value, withIdentity);
+      const roomId = `replace-${Date.now()}`;
+      const oldAlice = await connect(roomId);
+      const bob = await connect(roomId);
+      await oldAlice.next();
+      await bob.next();
 
-    await join(oldAlice, client("alice-owner"));
-    await join(bob, client("bob-owner"));
-    await bob.next();
-    await oldAlice.next();
+      await joinPeer(oldAlice, client("alice-owner"));
+      await joinPeer(bob, client("bob-owner"));
+      await bob.next();
+      await oldAlice.next();
 
-    const replacement = await connect(roomId);
-    await replacement.next();
-    const acknowledgement = await join(
-      replacement,
-      client("alice-owner", {
-        createdAt: Date.now() + 1,
-      }),
-    );
-    expect(acknowledgement.data).toMatchObject({
-      resumed: false,
-    });
+      const replacement = await connect(roomId);
+      await replacement.next();
+      const acknowledgement = await joinPeer(
+        replacement,
+        client("alice-owner", {
+          createdAt: Date.now() + 1,
+        }),
+      );
+      expect(acknowledgement.data).toMatchObject({
+        resumed: false,
+      });
 
-    expect(await bob.next()).toMatchObject({
-      type: "leave",
-      data: { clientId: "alice-owner" },
-    });
-    expect(await replacement.next()).toMatchObject({
-      type: "join",
-      data: { clientId: "bob-owner" },
-    });
-    expect(await bob.next()).toMatchObject({
-      type: "join",
-      data: { clientId: "alice-owner" },
-    });
+      expect(await bob.next()).toMatchObject({
+        type: "leave",
+        data: { clientId: "alice-owner" },
+      });
+      expect(await replacement.next()).toMatchObject({
+        type: "join",
+        data: { clientId: "bob-owner" },
+      });
+      expect(await bob.next()).toMatchObject({
+        type: "join",
+        data: { clientId: "alice-owner" },
+      });
 
-    try {
-      oldAlice.send({
+      try {
+        oldAlice.send({
+          type: "message",
+          data: {
+            type: "candidate",
+            clientId: "alice-owner",
+            targetClientId: "bob-owner",
+            data: "stale-candidate",
+          },
+        });
+        oldAlice.send({ type: "leave", data: null });
+      } catch {
+        // The replacement may already have completed the old socket close.
+      }
+
+      replacement.send({
         type: "message",
         data: {
           type: "candidate",
           clientId: "alice-owner",
           targetClientId: "bob-owner",
-          data: "stale-candidate",
+          data: "current-candidate",
         },
       });
-      oldAlice.send({ type: "leave", data: null });
-    } catch {
-      // The replacement may already have completed the old socket close.
-    }
 
-    replacement.send({
-      type: "message",
-      data: {
-        type: "candidate",
-        clientId: "alice-owner",
-        targetClientId: "bob-owner",
-        data: "current-candidate",
-      },
-    });
-
-    expect(await bob.next()).toEqual({
-      type: "message",
-      data: {
-        type: "candidate",
-        clientId: "alice-owner",
-        targetClientId: "bob-owner",
-        data: "current-candidate",
-      },
-    });
-  });
+      expect(await bob.next()).toEqual({
+        type: "message",
+        data: {
+          type: "candidate",
+          clientId: "alice-owner",
+          targetClientId: "bob-owner",
+          data: "current-candidate",
+        },
+      });
+    },
+  );
 
   it("closes a socket that tries to change client ID", async () => {
     const inbox = await connect(`change-id-${Date.now()}`);
@@ -458,84 +467,89 @@ describe("WebSocket server security limits", () => {
     expect((await oversized.closed()).code).toBe(1009);
   });
 
-  it("keeps only the latest 256 cached signals", async () => {
-    const roomId = `cache-${Date.now()}`;
-    const alice = await connect(roomId);
-    const bob = await connect(roomId);
-    await alice.next();
-    await bob.next();
-    await join(alice, client("alice-cache"));
-    await join(bob, client("bob-cache"));
-    await bob.next();
-    await alice.next();
+  it.each([true, false])(
+    "keeps only the latest 256 cached signals (signed=%s)",
+    async (withIdentity) => {
+      const joinPeer = (inbox: SocketInbox, value: unknown) =>
+        join(inbox, value, withIdentity);
+      const roomId = `cache-${Date.now()}`;
+      const alice = await connect(roomId);
+      const bob = await connect(roomId);
+      await alice.next();
+      await bob.next();
+      await joinPeer(alice, client("alice-cache"));
+      await joinPeer(bob, client("bob-cache"));
+      await bob.next();
+      await alice.next();
 
-    bob.close();
-    await bob.closed();
-    await Bun.sleep(20);
+      bob.close();
+      await bob.closed();
+      await Bun.sleep(20);
 
-    for (let sequence = 0; sequence < 300; sequence++) {
-      alice.send({
-        type: "message",
+      for (let sequence = 0; sequence < 300; sequence++) {
+        alice.send({
+          type: "message",
+          data: {
+            type: "candidate",
+            clientId: "alice-cache",
+            targetClientId: "bob-cache",
+            data: sequence,
+          },
+        });
+      }
+      await Bun.sleep(50);
+
+      const resumed = await connect(roomId);
+      await resumed.next();
+      const acknowledgement = await joinPeer(
+        resumed,
+        client("bob-cache", {
+          resume: true,
+          createdAt: Date.now() + 1,
+        }),
+      );
+      expect(acknowledgement.data).toMatchObject({
+        resumed: true,
+      });
+
+      const cached: number[] = [];
+      for (let index = 0; index < 256; index++) {
+        const signal = await resumed.next();
+        cached.push(
+          (
+            signal.data as {
+              data: number;
+            }
+          ).data,
+        );
+      }
+
+      expect(cached).toHaveLength(256);
+      expect(cached[0]).toBe(44);
+      expect(cached.at(-1)).toBe(299);
+      expect(await alice.next()).toEqual({
+        type: "peer-online",
         data: {
-          type: "candidate",
-          clientId: "alice-cache",
-          targetClientId: "bob-cache",
-          data: sequence,
+          clientId: "bob-cache",
+          connectionId: expect.any(String),
         },
       });
-    }
-    await Bun.sleep(50);
-
-    const resumed = await connect(roomId);
-    await resumed.next();
-    const acknowledgement = await join(
-      resumed,
-      client("bob-cache", {
-        resume: true,
-        createdAt: Date.now() + 1,
-      }),
-    );
-    expect(acknowledgement.data).toMatchObject({
-      resumed: true,
-    });
-
-    const cached: number[] = [];
-    for (let index = 0; index < 256; index++) {
-      const signal = await resumed.next();
-      cached.push(
-        (
-          signal.data as {
-            data: number;
-          }
-        ).data,
-      );
-    }
-
-    expect(cached).toHaveLength(256);
-    expect(cached[0]).toBe(44);
-    expect(cached.at(-1)).toBe(299);
-    expect(await alice.next()).toEqual({
-      type: "peer-online",
-      data: {
-        clientId: "bob-cache",
-        connectionId: expect.any(String),
-      },
-    });
-    await join(resumed, client("bob-cache", { resume: true }));
-    resumed.send({
-      type: "message",
-      data: {
-        type: "offer",
-        clientId: "bob-cache",
-        targetClientId: "alice-cache",
-        data: "after-resume",
-      },
-    });
-    expect(await alice.next()).toMatchObject({
-      type: "message",
-      data: { data: "after-resume" },
-    });
-  });
+      await joinPeer(resumed, client("bob-cache", { resume: true }));
+      resumed.send({
+        type: "message",
+        data: {
+          type: "offer",
+          clientId: "bob-cache",
+          targetClientId: "alice-cache",
+          data: "after-resume",
+        },
+      });
+      expect(await alice.next()).toMatchObject({
+        type: "message",
+        data: { data: "after-resume" },
+      });
+    },
+  );
 });
 
 it("ignores unsigned, wrong-key and replayed duplicate IDs without evicting the authenticated device", async () => {
@@ -571,7 +585,8 @@ it("ignores unsigned, wrong-key and replayed duplicate IDs without evicting the 
     });
     expect(await candidate.next()).toMatchObject({
       type: "error",
-      data: "DUPLICATE_DEVICE_ID",
+      data:
+        attack === "replay" ? "INVALID_DEVICE_PROOF" : "DUPLICATE_DEVICE_ID",
     });
     expect((await candidate.closed()).code).toBe(1008);
     owner.send({
@@ -608,5 +623,66 @@ it("ignores unsigned, wrong-key and replayed duplicate IDs without evicting the 
   expect(await peer.next()).toMatchObject({
     type: "join",
     data: { clientId: "real-device" },
+  });
+});
+
+describe("legacy signaling compatibility", () => {
+  async function open(room: string) {
+    const peer = await connect(room);
+    await peer.next();
+    return peer;
+  }
+
+  it.each([false, true])(
+    "rejects supplied invalid proofs without treating them as legacy (occupied=%s)",
+    async (occupied) => {
+      const room = crypto.randomUUID();
+      const presence = client("legacy-device");
+      let owner: SocketInbox | undefined;
+      if (occupied) {
+        owner = await open(room);
+        await join(owner, presence, false);
+      }
+      for (const mode of ["null", "malformed", "tampered"] as const) {
+        const candidate = await open(room);
+        const data =
+          mode === "tampered"
+            ? {
+                ...(await signed(candidate, presence)),
+                createdAt: presence.createdAt + 1,
+              }
+            : { ...presence, identityProof: mode === "null" ? null : {} };
+        candidate.send({ type: "join", data });
+        expect(await candidate.next()).toMatchObject({
+          type: "error",
+          data: "INVALID_DEVICE_PROOF",
+        });
+      }
+      if (!owner) {
+        owner = await open(room);
+        await join(owner, presence, false);
+      }
+      owner.send({ type: "ping", data: null });
+      expect(await owner.next()).toMatchObject({ type: "pong" });
+      expect(owner.socket.readyState).toBe(WebSocket.OPEN);
+    },
+  );
+
+  it("allows a legacy session to upgrade but never downgrade a verified owner", async () => {
+    const room = crypto.randomUUID();
+    const presence = client("upgrading-device");
+    const legacy = await open(room);
+    await join(legacy, presence, false);
+    const upgraded = await open(room);
+    await join(upgraded, { ...presence, resume: true });
+    const unsigned = await open(room);
+    unsigned.send({ type: "join", data: { ...presence, resume: true } });
+    expect(await unsigned.next()).toMatchObject({
+      type: "error",
+      data: "DUPLICATE_DEVICE_ID",
+    });
+    upgraded.send({ type: "ping", data: null });
+    expect(await upgraded.next()).toMatchObject({ type: "pong" });
+    expect(upgraded.socket.readyState).toBe(WebSocket.OPEN);
   });
 });

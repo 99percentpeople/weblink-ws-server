@@ -37,3 +37,29 @@ afterAll(async () => {
     await other.release(room, "peer", "after-expiry");
   },
 );
+
+(url ? it : it.skip)(
+  "moves unsigned leases across nodes and protects them after a signed upgrade",
+  async () => {
+    const room = crypto.randomUUID();
+    const a = new DeviceLeases(redis!, "a", 5000);
+    const b = new DeviceLeases(redis!, "b", 5000);
+    expect(await a.claim(room, "legacy", "first")).toBe(true);
+    expect(await a.claim(room, "legacy", "refresh")).toBe(true);
+    expect(await b.claim(room, "legacy", "moved")).toBe(true);
+    await a.release(room, "legacy", "refresh");
+    expect(await a.refresh(room, "legacy", "refresh")).toBe(false);
+    expect(await b.refresh(room, "legacy", "moved")).toBe(true);
+    expect(await b.claim(room, "legacy", "upgraded", "verified-key")).toBe(
+      true,
+    );
+    expect(await b.claim(room, "legacy", "downgrade")).toBe(false);
+    expect(await a.claim(room, "legacy", "remote-downgrade")).toBe(false);
+    expect(await a.claim(room, "legacy", "remote-signed", "verified-key")).toBe(
+      false,
+    );
+    await b.release(room, "legacy", "moved");
+    expect(await b.refresh(room, "legacy", "upgraded")).toBe(true);
+    await b.release(room, "legacy", "upgraded");
+  },
+);

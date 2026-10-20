@@ -49,5 +49,7 @@ export function mayReplace(
   existingKey: string | undefined,
   candidateKey: string | undefined,
 ): boolean {
-  return !!existingKey && existingKey === candidateKey;
+  // Legacy sessions retain their original replacement/reconnect behavior.
+  // Once a session has proved a key, replacement can never downgrade it.
+  return existingKey === undefined || existingKey === candidateKey;
 }

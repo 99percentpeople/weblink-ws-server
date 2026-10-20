@@ -90,7 +90,8 @@ const messageTails = new WeakMap<
   Promise<void>
 >();
 
-const redisSub: Redis | null = redisPub?.duplicate() ?? null;
+const redisSub: Redis | null =
+  redisPub?.duplicate({ autoResubscribe: false }) ?? null;
 
 redisPub?.on("error", (err) => {
   logger.error({ err }, "Error publishing to Redis channel");
@@ -102,27 +103,37 @@ redisSub?.on("error", (err) => {
 
 const rooms: Map<string, Room> = new Map();
 
+// Desired subscriptions survive reconnects, including rooms created before Redis
+// is ready. SUBSCRIBE must not race the connection's INFO readiness check.
 const subscribedChannels: Set<string> = new Set();
+redisSub?.on("ready", () => {
+  for (const roomId of subscribedChannels)
+    subscribeReadyChannel(`room:${roomId}`);
+});
+
+function subscribeReadyChannel(channel: string) {
+  redisSub?.subscribe(channel, (err, count) => {
+    if (err) {
+      logger.error({ err }, "Error subscribing to Redis channel");
+    } else {
+      logger.info(`Subscribed to ${count} channels`);
+    }
+  });
+}
 
 function subscribeToRedis(roomId: string) {
   if (!redisSub) return;
   // if already subscribed, do nothing
   if (subscribedChannels.has(roomId)) return;
-  redisSub.subscribe(`room:${roomId}`, (err, count) => {
-    if (err) {
-      logger.error({ err }, "Error subscribing to Redis channel");
-    } else {
-      subscribedChannels.add(roomId);
-      logger.info(`Subscribed to ${count} channels`);
-    }
-  });
+  subscribedChannels.add(roomId);
+  if (redisSub.status === "ready") subscribeReadyChannel(`room:${roomId}`);
 }
 
 function unsubscribeFromRedis(roomId: string) {
   if (!redisSub) return;
   // if not subscribed, do nothing
   if (!subscribedChannels.has(roomId)) return;
-  redisSub.unsubscribe(`room:${roomId}`);
+  if (redisSub.status === "ready") redisSub.unsubscribe(`room:${roomId}`);
   subscribedChannels.delete(roomId);
 }
 
@@ -137,7 +148,20 @@ function publishToRedis(roomId: string, signal: RedisSignal) {
   );
 }
 
+// Keep pub/sub events ordered while a remote legacy replacement checks its lease.
+const redisMessageTails = new Map<string, Promise<void>>();
 redisSub?.on("message", (channel, message) => {
+  const tail = (redisMessageTails.get(channel) ?? Promise.resolve())
+    .then(() => handleRedisMessage(channel, message))
+    .catch((error) => logger.error({ error }, "Redis signal handling failed"))
+    .finally(() => {
+      if (redisMessageTails.get(channel) === tail)
+        redisMessageTails.delete(channel);
+    });
+  redisMessageTails.set(channel, tail);
+});
+
+async function handleRedisMessage(channel: string, message: string) {
   const signal = JSON.parse(message) as RedisSignal;
   if (signal.origin === serverInstanceId) return;
   logger.info(`Received message on channel ${channel}`);
@@ -150,6 +174,23 @@ redisSub?.on("message", (channel, message) => {
 
   switch (signal.type) {
     case "join":
+      // Unsigned sessions can reconnect on another node. Retire the old local
+      // transport before announcing the replacement, without sending a stale leave.
+      const previous = room.clients.get(
+        (signal.data as TransferClient).clientId,
+      );
+      if (
+        previous &&
+        leases &&
+        !(await leases.refresh(
+          room.id,
+          previous.client.clientId,
+          previous.connectionId,
+        ))
+      ) {
+        retireLostLease(room, previous.session);
+        previous.session.close(1000, "Session replaced");
+      }
       handleClientJoin(room, signal.data as TransferClient, undefined, signal);
       break;
     case "message":
@@ -165,7 +206,7 @@ redisSub?.on("message", (channel, message) => {
       logger.warn({ signal }, "redis unknown signal type");
       break;
   }
-});
+}
 
 const server = Bun.serve<ServerWebSocketData>({
   port: PORT,
@@ -399,13 +440,20 @@ async function handleWSMessage(
         ws.close(1008, "Stale client session");
         return;
       }
-      if (!ws.data.clientId)
+      if (!ws.data.clientId) {
         ws.data.identityKey = await verifyJoinIdentity(
           ws.data.connectionId,
           client.clientId,
           client.createdAt,
           signal.data?.identityProof,
         );
+        // Absence of a proof is legacy; an invalid supplied proof is not.
+        if (signal.data?.identityProof !== undefined && !ws.data.identityKey) {
+          sendError(ws, "INVALID_DEVICE_PROOF");
+          ws.close(1008, "Invalid device proof");
+          return;
+        }
+      }
       if (ws.readyState !== WebSocket.OPEN) return;
       if (
         leases &&

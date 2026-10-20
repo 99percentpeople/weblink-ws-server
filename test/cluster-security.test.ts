@@ -1,9 +1,13 @@
 import { expect, it } from "bun:test";
 import Redis from "ioredis";
 const redis = process.env.WEBLINK_TEST_REDIS_URL;
-(redis ? it : it.skip)(
-  "rejects a same-ID candidate on another signaling node without interrupting the owner",
-  async () => {
+(redis ? it : it.skip).each([true, false])(
+  "protects signed owners while allowing legacy cross-node reconnects (signed=%s)",
+  async (withIdentity) => {
+    const room = crypto.randomUUID();
+    const connectionName = `weblink-test-${room}`;
+    const serverRedisUrl = new URL(redis!);
+    serverRedisUrl.searchParams.set("connectionName", connectionName);
     const ports = [21400 + (process.pid % 1000), 22400 + (process.pid % 1000)];
     const processes = ports.map((port) =>
       Bun.spawn(["bun", "src/index.ts"], {
@@ -12,18 +16,27 @@ const redis = process.env.WEBLINK_TEST_REDIS_URL;
           ...process.env,
           HOSTNAME: "127.0.0.1",
           PORT: String(port),
-          LOG_LEVEL: "silent",
-          REDIS_URL: redis!,
+          LOG_LEVEL: "info",
+          NODE_ENV: "production",
+          REDIS_URL: serverRedisUrl.href,
           HEARTBEAT_INTERVAL: "60000",
           PONG_TIMEOUT: "120000",
           DISCONNECT_TIMEOUT: "90000",
         },
-        stdout: "ignore",
+        stdout: "pipe",
         stderr: "pipe",
       }),
     );
+    const diagnostics = processes.map(async (p) =>
+      (
+        await Promise.all([
+          new Response(p.stdout).text(),
+          new Response(p.stderr).text(),
+        ])
+      ).join("\n"),
+    );
+    let failed = false;
     const sockets: WebSocket[] = [];
-    const room = crypto.randomUUID();
     const redisCheck = new Redis(redis!);
     async function subscribed(count: number) {
       const deadline = Date.now() + 5000;
@@ -58,6 +71,13 @@ const redis = process.env.WEBLINK_TEST_REDIS_URL;
       };
     }
     async function join(peer: Awaited<ReturnType<typeof connect>>, id: string) {
+      if (!withIdentity) {
+        peer.send({
+          type: "join",
+          data: { clientId: id, createdAt: Date.now(), resume: true },
+        });
+        return;
+      }
       const key = await crypto.subtle.generateKey(
         { name: "ECDSA", namedCurve: "P-256" },
         false,
@@ -115,13 +135,50 @@ const redis = process.env.WEBLINK_TEST_REDIS_URL;
         type: "join",
         data: { clientId: "owner" },
       });
+      // Disconnect only this fixture's subscriber connections. Membership and
+      // forwarding must survive Redis reconnects without rejoining the room.
+      const subscribers = String(
+        await redisCheck.client("LIST", "TYPE", "pubsub"),
+      )
+        .trim()
+        .split("\n")
+        .map((line) =>
+          Object.fromEntries(line.split(" ").map((field) => field.split("="))),
+        )
+        .filter((client) => client.name === connectionName);
+      expect(subscribers).toHaveLength(2);
+      for (const client of subscribers)
+        await redisCheck.client("KILL", "ID", client.id);
+      await subscribed(2);
       const attacker = await connect(ports[1]);
       await join(attacker, "owner");
-      expect(await attacker.next()).toMatchObject({
-        type: "error",
-        data: "DUPLICATE_DEVICE_ID",
-      });
-      owner.send({
+      if (withIdentity) {
+        expect(await attacker.next()).toMatchObject({
+          type: "error",
+          data: "DUPLICATE_DEVICE_ID",
+        });
+      } else {
+        expect(await attacker.next()).toMatchObject({
+          type: "joined",
+          data: { resumed: false },
+        });
+        expect(await attacker.next()).toMatchObject({
+          type: "join",
+          data: { clientId: "watcher" },
+        });
+        expect(await watcher.next()).toMatchObject({
+          type: "join",
+          data: { clientId: "owner" },
+        });
+        const deadline = Date.now() + 3000;
+        while (owner.socket.readyState !== WebSocket.CLOSED) {
+          if (Date.now() > deadline)
+            throw new Error("Old legacy owner stayed open");
+          await Bun.sleep(5);
+        }
+      }
+      const current = withIdentity ? owner : attacker;
+      current.send({
         type: "message",
         data: {
           type: "candidate",
@@ -134,12 +191,35 @@ const redis = process.env.WEBLINK_TEST_REDIS_URL;
         type: "message",
         data: { data: "still-alive" },
       });
-      expect(owner.socket.readyState).toBe(WebSocket.OPEN);
+      expect(current.socket.readyState).toBe(WebSocket.OPEN);
+      watcher.send({
+        type: "message",
+        data: {
+          type: "answer",
+          clientId: "watcher",
+          targetClientId: "owner",
+          data: "reply-after-reconnect",
+        },
+      });
+      // The original owner still has the watcher's initial join queued.
+      if (withIdentity) expect((await owner.next()).type).toBe("join");
+      expect(await current.next()).toMatchObject({
+        type: "message",
+        data: { data: "reply-after-reconnect" },
+      });
+    } catch (error) {
+      failed = true;
+      throw error;
     } finally {
       redisCheck.disconnect();
       sockets.forEach((s) => s.close());
       processes.forEach((p) => p.kill("SIGINT"));
       await Promise.all(processes.map((p) => p.exited));
+      const output = await Promise.all(diagnostics);
+      if (failed)
+        console.error(
+          output.join("\n").replaceAll(serverRedisUrl.href, "<test-redis>"),
+        );
     }
   },
   15000,

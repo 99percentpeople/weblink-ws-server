@@ -1,7 +1,7 @@
 import type Redis from "ioredis";
 
-// Atomic room-wide admission across Redis workers. A live lease on another node
-// is never displaced, including during failover; retry after its grace period.
+// Atomic room-wide admission across Redis workers. Signed leases on another node
+// are never displaced; unsigned leases retain legacy reconnect behavior.
 export class DeviceLeases {
   constructor(
     private readonly redis: Redis,
@@ -24,7 +24,7 @@ export class DeviceLeases {
       local old = redis.call('GET', KEYS[1])
       if old then
         local v = cjson.decode(old)
-        if v.node ~= ARGV[1] or (v.connection ~= ARGV[2] and (ARGV[3] == '' or v.key ~= ARGV[3])) then return 0 end
+        if v.key ~= '' and (v.node ~= ARGV[1] or v.key ~= ARGV[3]) then return 0 end
       end
       redis.call('SET', KEYS[1], cjson.encode({node=ARGV[1],connection=ARGV[2],key=ARGV[3]}), 'PX', ARGV[4])
       return 1
