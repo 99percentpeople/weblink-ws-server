@@ -1,4 +1,6 @@
 import { DeviceLeases } from "./device-lease";
+import { IpAdmissionLimiter } from "./ip-admission";
+import { isIP } from "node:net";
 import { verifyJoinIdentity, mayReplace } from "./device-identity";
 import pino from "pino";
 import { handleTurnCredentials } from "./turn-credentials";
@@ -14,6 +16,12 @@ import {
   TLS_KEY_FILE,
   TLS_CERT_FILE,
   TLS_ENABLED,
+  MAX_WS_HANDSHAKES_PER_IP_PER_MINUTE,
+  MAX_WS_CONNECTIONS_PER_IP,
+  MAX_ACTIVE_ROOMS,
+  MAX_CLIENTS_PER_ROOM,
+  WS_JOIN_TIMEOUT_MS,
+  TRUSTED_PROXY_IPS,
 } from "./var";
 import os from "os";
 import Redis from "ioredis";
@@ -73,7 +81,7 @@ const redisPub: Redis | null = REDIS_URL
   : null;
 
 if (redisPub) {
-  logger.info({ redisUrl: REDIS_URL }, "Redis is enabled");
+  logger.info("Redis is enabled");
 } else {
   logger.warn("Redis is disabled");
 }
@@ -102,6 +110,20 @@ redisSub?.on("error", (err) => {
 });
 
 const rooms: Map<string, Room> = new Map();
+const admission = new IpAdmissionLimiter(
+  MAX_WS_HANDSHAKES_PER_IP_PER_MINUTE,
+  MAX_WS_CONNECTIONS_PER_IP,
+);
+const joinTimeouts = new WeakMap<
+  ServerWebSocket<ServerWebSocketData>,
+  ReturnType<typeof setTimeout>
+>();
+
+function clearJoinTimeout(ws: ServerWebSocket<ServerWebSocketData>): void {
+  const timeout = joinTimeouts.get(ws);
+  if (timeout) clearTimeout(timeout);
+  joinTimeouts.delete(ws);
+}
 
 // Desired subscriptions survive reconnects, including rooms created before Redis
 // is ready. SUBSCRIBE must not race the connection's INFO readiness check.
@@ -164,11 +186,11 @@ redisSub?.on("message", (channel, message) => {
 async function handleRedisMessage(channel: string, message: string) {
   const signal = JSON.parse(message) as RedisSignal;
   if (signal.origin === serverInstanceId) return;
-  logger.info(`Received message on channel ${channel}`);
+  logger.debug("Received Redis message");
   const roomId = channel.slice("room:".length); // room ID
   const room = rooms.get(roomId);
   if (!room) {
-    logger.warn({ roomId }, "can not handle redis message, room not found");
+    logger.warn("Cannot handle Redis message: room not found");
     return;
   }
 
@@ -203,7 +225,7 @@ async function handleRedisMessage(channel: string, message: string) {
       broadcastPeerOnline(room, signal);
       break;
     default:
-      logger.warn({ signal }, "redis unknown signal type");
+      logger.warn({ signalType: signal.type }, "Unknown Redis signal type");
       break;
   }
 }
@@ -256,10 +278,24 @@ const server = Bun.serve<ServerWebSocketData>({
       });
     }
 
+    // Use the TCP peer unless it is an explicitly trusted reverse proxy.
+    // Trusted proxies must overwrite X-Real-IP rather than forward user input.
+    const peerIp = server.requestIP(req)?.address ?? "unknown";
+    const forwardedIp = req.headers.get("X-Real-IP")?.trim() ?? "";
+    const clientIp =
+      TRUSTED_PROXY_IPS.has(peerIp) && isIP(forwardedIp) ? forwardedIp : peerIp;
+    if (!admission.admit(clientIp)) {
+      return new Response("Too many WebSocket connections", {
+        status: 429,
+        headers: { "retry-after": "60", "cache-control": "no-store" },
+      });
+    }
+
     if (
       server.upgrade(req, {
         data: {
           roomId,
+          clientIp,
           passwordHash,
           clientId: null,
           connectionId: crypto.randomUUID(),
@@ -269,6 +305,7 @@ const server = Bun.serve<ServerWebSocketData>({
       return;
     }
 
+    admission.release(clientIp);
     return new Response(undefined, {
       status: 400,
       statusText: "Bad Request",
@@ -288,6 +325,8 @@ const server = Bun.serve<ServerWebSocketData>({
       messageTails.set(ws, tail);
     },
     close(ws) {
+      clearJoinTimeout(ws);
+      admission.release(ws.data.clientIp);
       handleWSClose(ws);
     },
   },
@@ -295,26 +334,25 @@ const server = Bun.serve<ServerWebSocketData>({
 
 function handleWSOpen(ws: ServerWebSocket<ServerWebSocketData>) {
   const { roomId, passwordHash } = ws.data;
-  logger.info({ remoteAddress: ws.remoteAddress, roomId }, "New connection");
+  logger.debug("New signaling connection");
 
-  let room: Room | undefined = rooms.get(roomId);
-  if (!room) {
-    room = {
-      id: roomId,
-      clients: new Map(),
-      passwordHash: passwordHash || null,
-    };
-    rooms.set(roomId, room);
-    subscribeToRedis(room.id);
-    logger.info({ roomId }, "Room created");
-  }
-
+  // A handshake must not allocate a room or subscribe to a Redis channel.
+  // Existing room password semantics remain client-side.
+  const room = rooms.get(roomId);
   ws.send(
     JSON.stringify({
       type: "connected",
-      data: room.passwordHash,
+      data: room?.passwordHash ?? (passwordHash || null),
       identityChallenge: ws.data.connectionId,
     }),
+  );
+  joinTimeouts.set(
+    ws,
+    setTimeout(() => {
+      if (ws.readyState === WebSocket.OPEN && !ws.data.clientId) {
+        ws.close(1008, "Join timeout");
+      }
+    }, WS_JOIN_TIMEOUT_MS),
   );
 }
 
@@ -388,8 +426,9 @@ async function handleWSMessage(
   let signal: RawSignal;
   try {
     signal = parseRawSignal(message);
-  } catch (error) {
-    logger.warn({ error }, "Invalid signal");
+  } catch {
+    // JSON parsing errors can embed attacker-controlled payload fragments.
+    logger.warn("Invalid signal");
     sendError(ws, "Invalid signal");
     return;
   }
@@ -400,23 +439,24 @@ async function handleWSMessage(
   }
 
   const room: Room | undefined = rooms.get(ws.data.roomId);
-  if (!room) {
-    logger.warn({ roomId: ws.data.roomId }, "Room not found");
+  if (!room && signal.type !== "join") {
+    // Do not reveal room details for messages from unjoined connections.
+    if (signal.type !== "pong") sendError(ws, "Invalid client signal");
     return;
   }
 
   if (signal.type === "pong") {
-    const clientData = currentClientData(room, ws);
+    const clientData = currentClientData(room!, ws);
     if (clientData) {
       if (
         leases &&
         !(await leases.refresh(
-          room.id,
+          ws.data.roomId,
           clientData.client.clientId,
           ws.data.connectionId,
         ))
       ) {
-        retireLostLease(room, ws);
+        retireLostLease(room!, ws);
         ws.close(1008, "Device lease expired");
         return;
       }
@@ -436,7 +476,7 @@ async function handleWSMessage(
         ws.close(1008, "Client ID cannot change");
         return;
       }
-      if (ws.data.clientId && !currentClientData(room, ws)) {
+      if (ws.data.clientId && (!room || !currentClientData(room, ws))) {
         ws.close(1008, "Stale client session");
         return;
       }
@@ -458,7 +498,7 @@ async function handleWSMessage(
       if (
         leases &&
         !(await leases.claim(
-          room.id,
+          ws.data.roomId,
           client.clientId,
           ws.data.connectionId,
           ws.data.identityKey,
@@ -469,10 +509,41 @@ async function handleWSMessage(
         return;
       }
       if (ws.readyState !== WebSocket.OPEN) {
-        await leases?.release(room.id, client.clientId, ws.data.connectionId);
+        await leases?.release(
+          ws.data.roomId,
+          client.clientId,
+          ws.data.connectionId,
+        );
         return;
       }
-      handleClientJoin(room, client, ws);
+      // Re-check capacity after asynchronous lease operations.
+      let joinRoom = rooms.get(ws.data.roomId);
+      if (
+        (!joinRoom && rooms.size >= MAX_ACTIVE_ROOMS) ||
+        (joinRoom &&
+          !joinRoom.clients.has(client.clientId) &&
+          joinRoom.clients.size >= MAX_CLIENTS_PER_ROOM)
+      ) {
+        await leases?.release(
+          ws.data.roomId,
+          client.clientId,
+          ws.data.connectionId,
+        );
+        sendError(ws, "Room capacity reached");
+        ws.close(1008, "Room capacity reached");
+        return;
+      }
+      if (!joinRoom) {
+        joinRoom = {
+          id: ws.data.roomId,
+          clients: new Map(),
+          passwordHash: ws.data.passwordHash || null,
+        };
+        rooms.set(joinRoom.id, joinRoom);
+        subscribeToRedis(joinRoom.id);
+      }
+      handleClientJoin(joinRoom, client, ws);
+      if (ws.data.clientId === client.clientId) clearJoinTimeout(ws);
       return;
     }
     case "message": {
@@ -481,35 +552,43 @@ async function handleWSMessage(
         sendError(ws, "Invalid client signal");
         return;
       }
-      if (!currentClientData(room, ws)) {
+      if (!currentClientData(room!, ws)) {
         ws.close(1008, "Stale client session");
         return;
       }
       if (
         leases &&
-        !(await leases.refresh(room.id, data.clientId, ws.data.connectionId))
+        !(await leases.refresh(
+          ws.data.roomId,
+          data.clientId,
+          ws.data.connectionId,
+        ))
       ) {
-        retireLostLease(room, ws);
+        retireLostLease(room!, ws);
         ws.close(1008, "Device lease expired");
         return;
       }
-      handleClientMessage(room, data, ws);
+      handleClientMessage(room!, data, ws);
       return;
     }
     case "leave":
       if (
         leases &&
         ws.data.clientId &&
-        !(await leases.refresh(room.id, ws.data.clientId, ws.data.connectionId))
+        !(await leases.refresh(
+          ws.data.roomId,
+          ws.data.clientId,
+          ws.data.connectionId,
+        ))
       ) {
-        retireLostLease(room, ws);
+        retireLostLease(room!, ws);
         ws.close(1008, "Device lease expired");
         return;
       }
-      handleExplicitLeave(room, ws);
+      handleExplicitLeave(room!, ws);
       return;
     default:
-      logger.warn({ signal }, "Unknown signal type");
+      logger.warn({ signalType: signal.type }, "Unknown signal type");
       sendError(ws, "Unknown signal type");
   }
 }
@@ -525,16 +604,13 @@ function retireLostLease(room: Room, ws: ServerWebSocket<ServerWebSocketData>) {
 function handleWSClose(ws: ServerWebSocket<ServerWebSocketData>) {
   const room: Room | undefined = rooms.get(ws.data.roomId);
   if (!room) {
-    logger.warn({ roomId: ws.data.roomId }, "Room not found");
+    logger.debug("Room not found for closing connection");
     return;
   }
 
   const clientData = currentClientData(room, ws);
   if (!clientData) {
-    logger.info(
-      { clientId: ws.data.clientId, roomId: room.id },
-      "Ignore stale close event",
-    );
+    logger.debug({ clientId: ws.data.clientId }, "Ignore stale close event");
     return;
   }
 
@@ -761,7 +837,6 @@ function handleClientLeave(
       logger.info(
         {
           clientId: client.clientId,
-          roomId: room.id,
           connectionId: ws.data.connectionId,
         },
         "Ignore stale leave event",
@@ -807,7 +882,7 @@ function handleClientLeave(
   if (room.clients.size === 0) {
     rooms.delete(room.id);
     unsubscribeFromRedis(room.id);
-    logger.info({ roomId: room.id }, "Room deleted");
+    logger.debug("Room deleted");
   }
 }
 
@@ -857,14 +932,12 @@ function handleClientMessage(
 function startHeartbeat() {
   setInterval(() => {
     const now = Date.now();
-    rooms.forEach((room, roomId) => {
+    admission.prune(now);
+    rooms.forEach((room) => {
       room.clients.forEach((clientData, clientId) => {
         if (clientData.session.readyState === WebSocket.OPEN) {
           if (now - clientData.lastPongTime > PONG_TIMEOUT) {
-            logger.warn(
-              { clientId, roomId },
-              "Client timed out, closing connection",
-            );
+            logger.warn({ clientId }, "Client timed out, closing connection");
             clientData.session.close();
           } else {
             clientData.session.send(JSON.stringify({ type: "ping" }));

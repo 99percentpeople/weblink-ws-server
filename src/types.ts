@@ -23,6 +23,7 @@ export interface ClientSignal extends RawSignal {
 
 export type ServerWebSocketData = {
   roomId: string;
+  clientIp: string;
   passwordHash: string;
   clientId: ClientID | null;
   connectionId: string;

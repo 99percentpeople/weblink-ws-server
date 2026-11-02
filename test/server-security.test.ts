@@ -155,9 +155,13 @@ async function waitForServer(): Promise<void> {
   throw new Error("Server did not start");
 }
 
-async function connect(roomId: string): Promise<SocketInbox> {
+async function connect(
+  roomId: string,
+  passwordHash = "",
+): Promise<SocketInbox> {
   const url = new URL(wsBase);
   url.searchParams.set("room", roomId);
+  if (passwordHash) url.searchParams.set("pwd", passwordHash);
   const inbox = new SocketInbox(new WebSocket(url.toString()));
   sockets.push(inbox);
   await inbox.opened();
@@ -236,6 +240,9 @@ beforeAll(async () => {
       REDIS_URL: "",
       TURN_KEY_ID: "",
       TURN_KEY_API_TOKEN: "",
+      // The admission unit tests cover low limits independently.
+      MAX_WS_HANDSHAKES_PER_IP_PER_MINUTE: "1000",
+      MAX_WS_CONNECTIONS_PER_IP: "1000",
     },
     stdin: "ignore",
     stdout: "ignore",
@@ -267,6 +274,53 @@ describe("TURN HTTP routing", () => {
     expect(await credentials.json()).toEqual({
       error: "TURN is not configured",
     });
+  });
+});
+
+describe("Room allocation and privacy", () => {
+  it("does not create or reserve a room for a disconnected, unjoined socket", async () => {
+    const room = `abandoned-${crypto.randomUUID()}`;
+    const abandoned = await connect(room, "unjoined-password-hash");
+    expect(await abandoned.next()).toMatchObject({
+      type: "connected",
+      data: "unjoined-password-hash",
+    });
+    abandoned.close();
+    await abandoned.closed();
+
+    const owner = await connect(room, "joined-password-hash");
+    expect(await owner.next()).toMatchObject({
+      type: "connected",
+      data: "joined-password-hash",
+    });
+    await join(owner, client("owner"));
+
+    const peer = await connect(room, "different-hash");
+    expect(await peer.next()).toMatchObject({
+      type: "connected",
+      data: "joined-password-hash",
+    });
+  });
+
+  it("does not allocate a room for an invalid join or offer a room listing endpoint", async () => {
+    const room = `invalid-${crypto.randomUUID()}`;
+    const attacker = await connect(room, "wrong-hash");
+    await attacker.next();
+    attacker.send({ type: "join", data: { clientId: "", createdAt: 1 } });
+    expect(await attacker.next()).toMatchObject({
+      type: "error",
+      data: "Invalid client",
+    });
+    attacker.close();
+    await attacker.closed();
+
+    const legitimate = await connect(room, "new-hash");
+    expect(await legitimate.next()).toMatchObject({
+      type: "connected",
+      data: "new-hash",
+    });
+    const listResponse = await fetch(`${httpBase}/rooms`);
+    expect(listResponse.status).toBe(426);
   });
 });
 

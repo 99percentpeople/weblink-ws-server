@@ -30,6 +30,41 @@ server support before the new frontend; old clients ignore this additive event.
 
 Signaling presence contains only room/connection metadata such as `clientId`, `createdAt`, the RTC profile protocol version, and the reconnect flag. The server discards incoming `name` and `avatar` fields before storing, broadcasting, or publishing presence to Redis. All display names and avatars are exchanged directly between peers over WebRTC.
 
+### WebSocket abuse protection and room privacy
+
+A WebSocket upgrade no longer creates a room or a Redis subscription. A valid
+`join` installs the room; a socket that does not join in 15 seconds is closed.
+Only the WebSocket route is rate-limited. `/turn-credentials` remains intentionally
+public and unchanged.
+
+Default settings (all configurable through the corresponding environment variables):
+
+| Environment variable | Default | Purpose |
+| --- | ---: | --- |
+| `MAX_WS_HANDSHAKES_PER_IP_PER_MINUTE` | 60 | Accepted upgrade attempts per IP / 60 seconds |
+| `MAX_WS_CONNECTIONS_PER_IP` | 64 | Concurrent WebSocket connections per IP |
+| `WS_JOIN_TIMEOUT_MS` | 15000 | Time to complete initial join |
+| `MAX_ACTIVE_ROOMS` | 10000 | Concurrent nonempty / reconnect-grace rooms per process |
+| `MAX_CLIENTS_PER_ROOM` | 128 | Local room membership cap per process |
+| `TRUSTED_PROXY_IPS` | empty | Comma-separated immediate TCP proxy IPs |
+
+The source IP defaults to Bun's `server.requestIP(req)`. Untrusted
+`X-Forwarded-For`, `CF-Connecting-IP`, and `X-Real-IP` headers are not used.
+If deployed behind a trusted reverse proxy, set `TRUSTED_PROXY_IPS` to its TCP
+peer IP and configure the proxy to **overwrite**, never merely forward, the
+`X-Real-IP` header. Without this, multiple users behind the same proxy are
+intentionally counted as one IP. The limiter is in-process: for multiple Bun
+instances, enforce a shared edge proxy/WAF limit as well.
+
+The service exposes no room-list API, and no longer writes plaintext room IDs
+to application logs. Redis Pub/Sub channel names still include room IDs:
+restrict Redis access, require authenticated encrypted connections for remote
+Redis, and protect Redis logs/metrics. The existing frontend-only password
+verification is unchanged. As a consequence, guessing a valid room ID can
+still reveal its password verifier/peer presence through the existing protocol;
+this protection is **anti-abuse**, not server-enforced private-room access.
+Use cryptographically unpredictable room IDs.
+
 ### TLS Setup
 
 TLS is optional and can be enabled with the `TLS_CERT_FILE` and `TLS_KEY_FILE` environment variables. For local development, copy `.env.example` to ignored `.env.local` and adjust it as needed.
