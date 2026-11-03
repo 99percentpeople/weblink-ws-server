@@ -660,19 +660,23 @@ function handleWSClose(ws: ServerWebSocket<ServerWebSocketData>) {
       void (async () => {
         if (
           leases &&
-          !(await leases.refresh(
-            room.id,
-            clientData.client.clientId,
-            ws.data.connectionId,
-          ))
+          (redisPub?.status !== "ready" ||
+            !(await leases.refresh(
+              room.id,
+              clientData.client.clientId,
+              ws.data.connectionId,
+            )))
         ) {
           retireLostLease(room, ws);
           return;
         }
         handleClientLeave(room, clientData.client, ws);
-      })().catch((error) =>
-        logger.error({ error }, "Lease expiry check failed"),
-      );
+      })().catch((error) => {
+        logger.error({ error }, "Lease expiry check failed");
+        // Ownership is unknown. Drop this local session without broadcasting
+        // a leave for a possible replacement on another node.
+        retireLostLease(room, ws);
+      });
     }, DISCONNECT_TIMEOUT);
   }
 }
