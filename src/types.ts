@@ -23,7 +23,8 @@ export interface ClientSignal extends RawSignal {
 
 export type ServerWebSocketData = {
   roomId: string;
-  passwordHash: string;
+  clientIp: string;
+  handshakePasswordHash: string | null;
   clientId: ClientID | null;
   connectionId: string;
   identityKey?: string;
@@ -42,5 +43,7 @@ export interface ClientData {
 export interface Room {
   id: string;
   clients: Map<ClientID, ClientData>;
-  passwordHash: string | null;
+  // Undefined until the first admitted member commits the room verifier.
+  passwordHash?: string | null;
+  joinTail?: Promise<void>;
 }
