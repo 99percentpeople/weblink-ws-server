@@ -37,6 +37,12 @@ A WebSocket upgrade no longer creates a room or a Redis subscription. A valid
 Only the WebSocket route is rate-limited. `/turn-credentials` remains intentionally
 public and unchanged.
 
+The first admitted local member establishes the room's password verifier.
+If that verifier changes between `connected` and `join`, the pending socket
+closes with code 1013. Reconnect to validate the new handshake. An established
+public room sends `null`. In a Redis cluster, room verifiers are local to each
+process. Route a room to the same node when it needs a single verifier.
+
 Default settings (all configurable through the corresponding environment variables):
 
 | Environment variable | Default | Purpose |

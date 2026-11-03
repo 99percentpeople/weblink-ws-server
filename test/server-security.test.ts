@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import type { RawSignal, TransferClient } from "../src/types";
+import type { webcrypto } from "node:crypto";
 
 interface SocketCloseInfo {
   code: number;
@@ -74,7 +75,7 @@ class SocketInbox {
     this.socket.send(JSON.stringify(signal));
   }
 
-  async next(): Promise<RawSignal> {
+  async next(): Promise<RawSignal & { identityChallenge?: string }> {
     const queued = this.queued.shift();
     if (queued) return queued;
 
@@ -168,7 +169,7 @@ async function connect(
   return inbox;
 }
 
-const keys = new Map<string, CryptoKeyPair>();
+const keys = new Map<string, webcrypto.CryptoKeyPair>();
 async function signed(
   inbox: SocketInbox,
   value: TransferClient,
@@ -278,6 +279,26 @@ describe("TURN HTTP routing", () => {
 });
 
 describe("Room allocation and privacy", () => {
+  it.each(["", "owner-hash"])(
+    "requires a fresh handshake when another verifier wins (owner=%s)",
+    async (ownerHash) => {
+      const room = crypto.randomUUID();
+      const pending = await connect(room, ownerHash ? "" : "pending-hash");
+      expect((await pending.next()).data).toBe(
+        ownerHash ? null : "pending-hash",
+      );
+      const owner = await connect(room, ownerHash);
+      expect((await owner.next()).data).toBe(ownerHash || null);
+      await join(owner, client("owner"));
+      pending.send({ type: "join", data: client("late") });
+      expect((await pending.closed()).code).toBe(1013);
+
+      const retry = await connect(room, "new-salted-hash");
+      expect((await retry.next()).data).toBe(ownerHash || null);
+      await join(retry, client("late"));
+    },
+  );
+
   it("does not create or reserve a room for a disconnected, unjoined socket", async () => {
     const room = `abandoned-${crypto.randomUUID()}`;
     const abandoned = await connect(room, "unjoined-password-hash");

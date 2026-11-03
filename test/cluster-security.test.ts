@@ -1,16 +1,17 @@
 import { expect, it } from "bun:test";
 import Redis from "ioredis";
-const redis = process.env.WEBLINK_TEST_REDIS_URL;
-(redis ? it : it.skip).each([true, false])(
-  "protects signed owners while allowing legacy cross-node reconnects (signed=%s)",
-  async (withIdentity) => {
+const redis = process.env["WEBLINK_TEST_REDIS_URL"];
+it.each(redis ? ["signed", "legacy", "full"] : [])(
+  "preserves ownership and presence across Redis nodes (%s)",
+  async (scenario) => {
+    const withIdentity = scenario === "signed";
     const room = crypto.randomUUID();
     const connectionName = `weblink-test-${room}`;
     const serverRedisUrl = new URL(redis!);
     serverRedisUrl.searchParams.set("connectionName", connectionName);
     const ports = [21400 + (process.pid % 1000), 22400 + (process.pid % 1000)];
     const processes = ports.map((port) =>
-      Bun.spawn(["bun", "src/index.ts"], {
+      Bun.spawn([process.execPath, "src/index.ts"], {
         cwd: import.meta.dir + "/..",
         env: {
           ...process.env,
@@ -19,6 +20,7 @@ const redis = process.env.WEBLINK_TEST_REDIS_URL;
           LOG_LEVEL: "info",
           NODE_ENV: "production",
           REDIS_URL: serverRedisUrl.href,
+          MAX_CLIENTS_PER_ROOM: scenario === "full" ? "1" : "128",
           HEARTBEAT_INTERVAL: "60000",
           PONG_TIMEOUT: "120000",
           DISCONNECT_TIMEOUT: "90000",
@@ -123,12 +125,9 @@ const redis = process.env.WEBLINK_TEST_REDIS_URL;
         }
       }
       const owner = await connect(ports[0]);
-      await subscribed(1);
       await join(owner, "owner");
       expect((await owner.next()).type).toBe("joined");
       const watcher = await connect(ports[1]);
-      // Wait for subscription acknowledgements, not a timing assumption.
-      await subscribed(2);
       await join(watcher, "watcher");
       expect((await watcher.next()).type).toBe("joined");
       expect(await watcher.next()).toMatchObject({
@@ -138,7 +137,7 @@ const redis = process.env.WEBLINK_TEST_REDIS_URL;
       // Disconnect only this fixture's subscriber connections. Membership and
       // forwarding must survive Redis reconnects without rejoining the room.
       const subscribers = String(
-        await redisCheck.client("LIST", "TYPE", "pubsub"),
+        await redisCheck.call("CLIENT", "LIST", "TYPE", "pubsub"),
       )
         .trim()
         .split("\n")
@@ -152,10 +151,11 @@ const redis = process.env.WEBLINK_TEST_REDIS_URL;
       await subscribed(2);
       const attacker = await connect(ports[1]);
       await join(attacker, "owner");
-      if (withIdentity) {
+      const preservedOwner = scenario !== "legacy";
+      if (preservedOwner) {
         expect(await attacker.next()).toMatchObject({
           type: "error",
-          data: "DUPLICATE_DEVICE_ID",
+          data: withIdentity ? "DUPLICATE_DEVICE_ID" : "Room capacity reached",
         });
       } else {
         expect(await attacker.next()).toMatchObject({
@@ -177,7 +177,7 @@ const redis = process.env.WEBLINK_TEST_REDIS_URL;
           await Bun.sleep(5);
         }
       }
-      const current = withIdentity ? owner : attacker;
+      const current = preservedOwner ? owner : attacker;
       current.send({
         type: "message",
         data: {
@@ -202,7 +202,7 @@ const redis = process.env.WEBLINK_TEST_REDIS_URL;
         },
       });
       // The original owner still has the watcher's initial join queued.
-      if (withIdentity) expect((await owner.next()).type).toBe("join");
+      if (preservedOwner) expect((await owner.next()).type).toBe("join");
       expect(await current.next()).toMatchObject({
         type: "message",
         data: { data: "reply-after-reconnect" },

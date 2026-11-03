@@ -2,7 +2,7 @@ import { afterAll, expect, it } from "bun:test";
 import Redis from "ioredis";
 import { DeviceLeases } from "../src/device-lease";
 // Optional external fixture; never use the application's configured Redis DB.
-const url = process.env.WEBLINK_TEST_REDIS_URL;
+const url = process.env["WEBLINK_TEST_REDIS_URL"];
 const redis = url ? new Redis(url) : undefined;
 afterAll(async () => {
   await redis?.quit();

@@ -1,6 +1,7 @@
 import { DeviceLeases } from "./device-lease";
 import { IpAdmissionLimiter } from "./ip-admission";
 import { isIP } from "node:net";
+import { once } from "node:events";
 import { verifyJoinIdentity, mayReplace } from "./device-identity";
 import pino from "pino";
 import { handleTurnCredentials } from "./turn-credentials";
@@ -83,7 +84,7 @@ const redisPub: Redis | null = REDIS_URL
 if (redisPub) {
   logger.info("Redis is enabled");
 } else {
-  logger.warn("Redis is disabled");
+  logger.info("Redis is disabled");
 }
 
 const leases = redisPub
@@ -125,38 +126,32 @@ function clearJoinTimeout(ws: ServerWebSocket<ServerWebSocketData>): void {
   joinTimeouts.delete(ws);
 }
 
-// Desired subscriptions survive reconnects, including rooms created before Redis
-// is ready. SUBSCRIBE must not race the connection's INFO readiness check.
-const subscribedChannels: Set<string> = new Set();
+// Rebuild active subscriptions on reconnect. Each joining socket also waits
+// for SUBSCRIBE's acknowledgement before publishing its presence request.
 redisSub?.on("ready", () => {
-  for (const roomId of subscribedChannels)
-    subscribeReadyChannel(`room:${roomId}`);
+  for (const room of rooms.values()) {
+    if (room.clients.size > 0) {
+      void subscribeToRedis(room.id).catch((err) =>
+        logger.error({ err }, "Error restoring Redis subscription"),
+      );
+    }
+  }
 });
 
-function subscribeReadyChannel(channel: string) {
-  redisSub?.subscribe(channel, (err, count) => {
-    if (err) {
-      logger.error({ err }, "Error subscribing to Redis channel");
-    } else {
-      logger.info(`Subscribed to ${count} channels`);
-    }
-  });
-}
-
-function subscribeToRedis(roomId: string) {
+let subscriberReady: Promise<unknown> | undefined;
+async function subscribeToRedis(roomId: string): Promise<void> {
   if (!redisSub) return;
-  // if already subscribed, do nothing
-  if (subscribedChannels.has(roomId)) return;
-  subscribedChannels.add(roomId);
-  if (redisSub.status === "ready") subscribeReadyChannel(`room:${roomId}`);
-}
-
-function unsubscribeFromRedis(roomId: string) {
-  if (!redisSub) return;
-  // if not subscribed, do nothing
-  if (!subscribedChannels.has(roomId)) return;
-  if (redisSub.status === "ready") redisSub.unsubscribe(`room:${roomId}`);
-  subscribedChannels.delete(roomId);
+  if (redisSub.status !== "ready") {
+    // SUBSCRIBE during the initial INFO readiness check can put the
+    // connection in subscriber mode too early.
+    subscriberReady ??= once(redisSub, "ready", {
+      signal: AbortSignal.timeout(WS_JOIN_TIMEOUT_MS),
+    }).finally(() => {
+      subscriberReady = undefined;
+    });
+    await subscriberReady;
+  }
+  await redisSub.subscribe(`room:${roomId}`);
 }
 
 function publishToRedis(roomId: string, signal: RedisSignal) {
@@ -296,7 +291,7 @@ const server = Bun.serve<ServerWebSocketData>({
         data: {
           roomId,
           clientIp,
-          passwordHash,
+          handshakePasswordHash: passwordHash || null,
           clientId: null,
           connectionId: crypto.randomUUID(),
         },
@@ -333,16 +328,19 @@ const server = Bun.serve<ServerWebSocketData>({
 });
 
 function handleWSOpen(ws: ServerWebSocket<ServerWebSocketData>) {
-  const { roomId, passwordHash } = ws.data;
+  const { roomId } = ws.data;
   logger.debug("New signaling connection");
 
   // A handshake must not allocate a room or subscribe to a Redis channel.
   // Existing room password semantics remain client-side.
   const room = rooms.get(roomId);
+  if (room?.passwordHash !== undefined) {
+    ws.data.handshakePasswordHash = room.passwordHash;
+  }
   ws.send(
     JSON.stringify({
       type: "connected",
-      data: room?.passwordHash ?? (passwordHash || null),
+      data: ws.data.handshakePasswordHash,
       identityChallenge: ws.data.connectionId,
     }),
   );
@@ -495,55 +493,7 @@ async function handleWSMessage(
         }
       }
       if (ws.readyState !== WebSocket.OPEN) return;
-      if (
-        leases &&
-        !(await leases.claim(
-          ws.data.roomId,
-          client.clientId,
-          ws.data.connectionId,
-          ws.data.identityKey,
-        ))
-      ) {
-        sendError(ws, "DUPLICATE_DEVICE_ID");
-        ws.close(1008, "Duplicate device ID");
-        return;
-      }
-      if (ws.readyState !== WebSocket.OPEN) {
-        await leases?.release(
-          ws.data.roomId,
-          client.clientId,
-          ws.data.connectionId,
-        );
-        return;
-      }
-      // Re-check capacity after asynchronous lease operations.
-      let joinRoom = rooms.get(ws.data.roomId);
-      if (
-        (!joinRoom && rooms.size >= MAX_ACTIVE_ROOMS) ||
-        (joinRoom &&
-          !joinRoom.clients.has(client.clientId) &&
-          joinRoom.clients.size >= MAX_CLIENTS_PER_ROOM)
-      ) {
-        await leases?.release(
-          ws.data.roomId,
-          client.clientId,
-          ws.data.connectionId,
-        );
-        sendError(ws, "Room capacity reached");
-        ws.close(1008, "Room capacity reached");
-        return;
-      }
-      if (!joinRoom) {
-        joinRoom = {
-          id: ws.data.roomId,
-          clients: new Map(),
-          passwordHash: ws.data.passwordHash || null,
-        };
-        rooms.set(joinRoom.id, joinRoom);
-        subscribeToRedis(joinRoom.id);
-      }
-      handleClientJoin(joinRoom, client, ws);
-      if (ws.data.clientId === client.clientId) clearJoinTimeout(ws);
+      await joinLocalRoom(ws, client);
       return;
     }
     case "message": {
@@ -593,12 +543,102 @@ async function handleWSMessage(
   }
 }
 
+async function joinLocalRoom(
+  ws: ServerWebSocket<ServerWebSocketData>,
+  client: TransferClient,
+): Promise<void> {
+  const { roomId } = ws.data;
+  let room = rooms.get(roomId);
+  if (!room) {
+    if (rooms.size >= MAX_ACTIVE_ROOMS) {
+      sendError(ws, "Room capacity reached");
+      ws.close(1008, "Room capacity reached");
+      return;
+    }
+    room = { id: roomId, clients: new Map() };
+    rooms.set(roomId, room);
+  }
+  // Reserve the room slot while Redis is in flight. Serialize admissions
+  // within this room so a capacity decision stays valid through lease claim.
+  const previous = room.joinTail;
+  const admit = () => admitLocalClient(room, client, ws);
+  const join = previous ? previous.then(admit, admit) : admit();
+  room.joinTail = join;
+  try {
+    await join;
+  } finally {
+    if (room.joinTail === join) {
+      delete room.joinTail;
+      cleanupEmptyRoom(room);
+    }
+  }
+}
+
+async function admitLocalClient(
+  room: Room,
+  client: TransferClient,
+  ws: ServerWebSocket<ServerWebSocketData>,
+): Promise<void> {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  const { handshakePasswordHash, identityKey, connectionId } = ws.data;
+  if (
+    room.passwordHash !== undefined &&
+    room.passwordHash !== handshakePasswordHash
+  ) {
+    ws.close(1013, "Room changed, reconnect");
+    return;
+  }
+  const existing = room.clients.get(client.clientId);
+  if (!existing && room.clients.size >= MAX_CLIENTS_PER_ROOM) {
+    sendError(ws, "Room capacity reached");
+    ws.close(1008, "Room capacity reached");
+    return;
+  }
+  if (existing && !mayReplace(existing.identityKey, identityKey)) {
+    sendError(ws, "DUPLICATE_DEVICE_ID");
+    ws.close(1008, "Duplicate device ID");
+    return;
+  }
+  if (leases) {
+    await subscribeToRedis(room.id);
+    if (ws.readyState !== WebSocket.OPEN) return;
+    if (
+      !(await leases.claim(room.id, client.clientId, connectionId, identityKey))
+    ) {
+      sendError(ws, "DUPLICATE_DEVICE_ID");
+      ws.close(1008, "Duplicate device ID");
+      return;
+    }
+    if (ws.readyState !== WebSocket.OPEN) {
+      await leases.release(room.id, client.clientId, connectionId);
+      return;
+    }
+  }
+  room.passwordHash = handshakePasswordHash;
+  handleClientJoin(room, client, ws);
+  clearJoinTimeout(ws);
+}
+
+function cleanupEmptyRoom(room: Room) {
+  if (room.clients.size || room.joinTail || rooms.get(room.id) !== room) return;
+  rooms.delete(room.id);
+  if (redisSub?.status === "ready") {
+    void redisSub
+      .unsubscribe(`room:${room.id}`)
+      .catch((err) =>
+        logger.error({ err }, "Error unsubscribing from Redis channel"),
+      );
+  }
+  logger.debug("Room deleted");
+}
+
 function retireLostLease(room: Room, ws: ServerWebSocket<ServerWebSocketData>) {
   const current = currentClientData(room, ws);
   if (!current) return;
   if (current.disconnectTimeout) clearTimeout(current.disconnectTimeout);
   room.clients.delete(current.client.clientId);
   ws.data.clientId = null;
+  cleanupEmptyRoom(room);
 }
 
 function handleWSClose(ws: ServerWebSocket<ServerWebSocketData>) {
@@ -665,14 +705,6 @@ function handleClientJoin(
       return;
     }
 
-    if (
-      existingClient &&
-      !mayReplace(existingClient.identityKey, ws.data.identityKey)
-    ) {
-      sendError(ws, "DUPLICATE_DEVICE_ID");
-      ws.close(1008, "Duplicate device ID");
-      return;
-    }
     ws.data.clientId = client.clientId;
 
     if (existingClient && client.resume) {
@@ -879,11 +911,7 @@ function handleClientLeave(
   }
 
   // if room is empty, delete room
-  if (room.clients.size === 0) {
-    rooms.delete(room.id);
-    unsubscribeFromRedis(room.id);
-    logger.debug("Room deleted");
-  }
+  cleanupEmptyRoom(room);
 }
 
 function handleClientMessage(
