@@ -228,7 +228,7 @@ async function join(
 }
 
 beforeAll(async () => {
-  serverProcess = Bun.spawn(["bun", "src/index.ts"], {
+  serverProcess = Bun.spawn([process.execPath, "src/index.ts"], {
     cwd: import.meta.dir + "/..",
     env: {
       ...process.env,
