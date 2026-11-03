@@ -1,8 +1,8 @@
 import { expect, it } from "bun:test";
 import Redis from "ioredis";
 const redis = process.env["WEBLINK_TEST_REDIS_URL"];
-it.each(redis ? ["signed", "legacy", "full"] : [])(
-  "preserves ownership and presence across Redis nodes (%s)",
+it.each(redis ? ["signed", "legacy", "full", "expiry"] : [])(
+  "maintains room membership across Redis nodes (%s)",
   async (scenario) => {
     const withIdentity = scenario === "signed";
     const room = crypto.randomUUID();
@@ -23,7 +23,7 @@ it.each(redis ? ["signed", "legacy", "full"] : [])(
           MAX_CLIENTS_PER_ROOM: scenario === "full" ? "1" : "128",
           HEARTBEAT_INTERVAL: "60000",
           PONG_TIMEOUT: "120000",
-          DISCONNECT_TIMEOUT: "90000",
+          DISCONNECT_TIMEOUT: scenario === "expiry" ? "250" : "90000",
         },
         stdout: "pipe",
         stderr: "pipe",
@@ -44,7 +44,7 @@ it.each(redis ? ["signed", "legacy", "full"] : [])(
       const deadline = Date.now() + 5000;
       while (true) {
         const result = await redisCheck.pubsub("NUMSUB", `room:${room}`);
-        if (Number(result[1]) >= count) return;
+        if (Number(result[1]) === count) return;
         if (Date.now() > deadline)
           throw new Error("Room subscription not ready");
         await Bun.sleep(10);
@@ -127,6 +127,17 @@ it.each(redis ? ["signed", "legacy", "full"] : [])(
       const owner = await connect(ports[0]);
       await join(owner, "owner");
       expect((await owner.next()).type).toBe("joined");
+      if (scenario === "expiry") {
+        const pending = await connect(ports[0]);
+        await subscribed(1);
+        // Force the Redis lease check to fail for this room only.
+        const key = `weblink:device:${JSON.stringify([room, "owner"])}`;
+        await redisCheck.set(key, "invalid-json", "PX", 10_000);
+        owner.socket.close();
+        await subscribed(0);
+        expect(pending.socket.readyState).toBe(WebSocket.OPEN);
+        return;
+      }
       const watcher = await connect(ports[1]);
       await join(watcher, "watcher");
       expect((await watcher.next()).type).toBe("joined");
